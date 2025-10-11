@@ -3,8 +3,13 @@ import speech_recognition as sr
 from llama_cpp import Llama
 import time
 import sys
+import os
 
 MODEL_PATH = "models/Qwen3-8B-Q4_K_M.gguf"
+
+def clear_screen():
+    """Clears the terminal screen."""
+    os.system('clear' if os.name == 'posix' else 'cls')
 
 def flash_screen():
     """Flashes the terminal screen by inverting colors briefly."""
@@ -29,12 +34,11 @@ def microphone_worker(queue):
             try:
                 audio = recognizer.listen(source)
                 print("Got audio, recognizing...")
-                # The model will be downloaded automatically on the first run.
                 text = recognizer.recognize_whisper(audio, model="base")
                 flash_screen()
                 if len(text.strip()) == 0:
+                    print("No speech detected, listening again...")
                     continue
-                print(f"You said: {text}")
                 queue.put(text)
             except sr.UnknownValueError:
                 print("Could not understand audio, listening again...")
@@ -42,7 +46,7 @@ def microphone_worker(queue):
                 print(f"API Error: {e}")
 
 def llm_worker(queue):
-    """Waits for text from a queue and generates a streaming response."""
+    """Waits for text from a queue, clears screen, and generates a streaming response."""
     print("Loading model...")
     llm = Llama(
         model_path=MODEL_PATH,
@@ -53,38 +57,37 @@ def llm_worker(queue):
     )
     print("Model loaded.")
 
-    # Initialize conversation history with a system prompt
     history = [
         {"role": "system", "content": "You are a helpful assistant."},
     ]
 
     while True:
-        user_input = queue.get() # This will block until an item is available
+        user_input = queue.get()
 
         if user_input.lower() in ["exit", "quit"]:
             print("Goodbye!")
             break
 
-        # Add user message to history
+        clear_screen()
+        print(f"You: {user_input}\n")
+
         history.append({"role": "user", "content": user_input})
 
         print("Bot: ", end="", flush=True)
         
         full_response = ""
-        # The streaming call is a generator, so it works fine in a sync context
         for chunk in llm.create_chat_completion(history, stream=True):
             content = chunk["choices"][0]["delta"].get("content")
             if content:
                 print(content, end="", flush=True)
                 full_response += content
         
-        # Add bot response to history
         history.append({"role": "assistant", "content": full_response})
         
-        print() # Newline after the full response
+        print()
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn") # 'spawn' is safer on macOS
+    mp.set_start_method("spawn")
     q = mp.Queue()
 
     mic_process = mp.Process(target=microphone_worker, args=(q,))
