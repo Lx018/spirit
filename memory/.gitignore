@@ -1,0 +1,16 @@
+*.md
+*.txt
+result.json
+embedding/all-mpnet-base-v2/*
+embedding/output/*
+llama-3-8b-bnb-4bit/*
+data_mem.json
+data.json
+raw_data.json
+outputs/*
+unsloth_compiled_cache/*
+llama38/*
+unsloth_llama3*
+raw_chat_data.json
+embedding/chatData/*
+embedding/chat_output/*

@@ -1,1 +1,8 @@
 *.gguf
+bot/*
+*.safetensors
+*.onnx
+memory/chatData*
+memory/embedding/chatData*
+memory/gemma/*
+memory/all-mpnet-base-v2/*
