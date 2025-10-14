@@ -2,18 +2,22 @@ import argparse
 import json
 import os
 
+# Disable Triton compilation issues
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
 # Argument parsing
 parser = argparse.ArgumentParser(description="Fine-tune a model with customizable learning rate and max steps.")
 parser.add_argument('-lr', '--learning_rate', type=float, default=2e-5, help='Learning rate for training.')
-parser.add_argument('-s', '--max_steps', type=int, default=60, help='Maximum number of training steps.')
-parser.add_argument('-off', '--offline', action='store_true', help='Enable offline mode.')
-parser.add_argument('-p', '--model_path', type=str, default="llama38", help='Path to local model for offline mode.')
+parser.add_argument('-s', '--max_steps', type=int, default=500, help='Maximum number of training steps.')
+parser.add_argument('-o', '--online', action='store_true', help='online mode.')
+parser.add_argument('-p', '--model_path', type=str, default="gemma", help='Path to local model for offline mode.')
 parser.add_argument('-b', '--batch_size', type=int, default=2, help='Batch size for training.')  # Added batch size argument
 args = parser.parse_args()
 
 output_dir = f"outputs/lr{args.learning_rate}_steps{args.max_steps}_b{args.batch_size}"
 # --- Mode Setup ---
-if args.offline:
+if not args.online:
     print("Running in OFFLINE mode.")
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     model_name = args.model_path
@@ -31,8 +35,9 @@ from transformers import TrainingArguments
 from trl import SFTTrainer
 
 # 1. Load the data
-with open('data.json', 'r') as f:
+with open('new.json', 'r') as f:
     data = json.load(f)
+    data = data["cases"]
 
 # 2. Create a Dataset object
 dataset = Dataset.from_list(data)
@@ -82,13 +87,21 @@ def formatting_prompts_func(examples):
     例子:
     [2,3,19,6,8,12,37......]
     """
-    inputs       = examples["input"]
-    outputs      = examples["output"]
     texts = []
-    for input_text, output_text in zip(inputs, outputs):
+    # Handle both batched and single examples
+    num_examples = len(examples["chat"]) if isinstance(examples["chat"], list) else 1
+    
+    for i in range(num_examples):
+        chat_item = examples["chat"][i] if isinstance(examples["chat"], list) else examples["chat"]
+        message_item = examples["message"][i] if isinstance(examples["message"], list) else examples["message"]
+        memory_item = examples["memory"][i] if isinstance(examples["memory"], list) else examples["memory"]
+        think_item = examples["think"][i] if isinstance(examples["think"], list) else examples["think"]
+        output_item = examples["activated_memory"][i] if isinstance(examples["activated_memory"], list) else examples["activated_memory"]
+        
         messages = [
-            {"role": "user", "content": f"{input_text}\n{instruction}"},
-            {"role": "assistant", "content": output_text},
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": chat_item + "\n memories:" + memory_item +"\n next message:" + message_item},
+            {"role": "assistant", "content": think_item+ "\nso the chosen memoryires are:" + output_item},
         ]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False) + EOS_TOKEN
         texts.append(text)
