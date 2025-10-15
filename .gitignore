@@ -7,3 +7,4 @@ memory/embedding/chatData*
 memory/gemma/*
 memory/all-mpnet-base-v2/*
 unsloth_compiled_cache/*
+memory/api_test_results*

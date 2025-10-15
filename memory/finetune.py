@@ -13,9 +13,10 @@ parser.add_argument('-s', '--max_steps', type=int, default=1000, help='Maximum n
 parser.add_argument('-o', '--online', action='store_true', help='online mode.')
 parser.add_argument('-p', '--model_path', type=str, default="gemma", help='Path to local model for offline mode.')
 parser.add_argument('-b', '--batch_size', type=int, default=2, help='Batch size for training.')  # Added batch size argument
+parser.add_argument('-r', '--rank', type=int, default=32, help='LoRA rank.')  # Added LoRA rank argument
 args = parser.parse_args()
 
-output_dir = f"outputs/lr{args.learning_rate}_steps{args.max_steps}_b{args.batch_size}"
+output_dir = f"output{args.model_path}/lr{args.learning_rate}_steps{args.max_steps}_b{args.batch_size}"
 # --- Mode Setup ---
 if not args.online:
     print("Running in OFFLINE mode.")
@@ -58,7 +59,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 # 4. Add LoRA adapters
 model = FastLanguageModel.get_peft_model(
     model,
-    r = 32,
+    r = args.rank,  # Use the rank argument
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                       "gate_proj", "up_proj", "down_proj",],
     lora_alpha = 16,
