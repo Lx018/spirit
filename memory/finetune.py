@@ -9,7 +9,7 @@ os.environ["TORCH_COMPILE_DISABLE"] = "1"
 # Argument parsing
 parser = argparse.ArgumentParser(description="Fine-tune a model with customizable learning rate and max steps.")
 parser.add_argument('-lr', '--learning_rate', type=float, default=2e-5, help='Learning rate for training.')
-parser.add_argument('-s', '--max_steps', type=int, default=500, help='Maximum number of training steps.')
+parser.add_argument('-s', '--max_steps', type=int, default=1000, help='Maximum number of training steps.')
 parser.add_argument('-o', '--online', action='store_true', help='online mode.')
 parser.add_argument('-p', '--model_path', type=str, default="gemma", help='Path to local model for offline mode.')
 parser.add_argument('-b', '--batch_size', type=int, default=2, help='Batch size for training.')  # Added batch size argument
@@ -58,7 +58,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 # 4. Add LoRA adapters
 model = FastLanguageModel.get_peft_model(
     model,
-    r = 16,
+    r = 32,
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                       "gate_proj", "up_proj", "down_proj",],
     lora_alpha = 16,
@@ -74,18 +74,12 @@ model = FastLanguageModel.get_peft_model(
 EOS_TOKEN = tokenizer.eos_token # Must add EOS_TOKEN
 def formatting_prompts_func(examples):
     instruction = """你是大脑中的记忆单元调度中枢，负责处理哪些记忆会被唤醒。你需要根据聊天记录、新的消息，来筛选出哪些关于能力与偏好的记忆是对回答新的消息有帮助、或对角色应对此时此刻下一秒的情景是有用的，并将消息的序号返回到activated_memory。注意，在思考<think>中不要输出超过2000token，思考尽量精简。
-
     现在请根据以下规则进行筛选：
     1.为了更好扮演角色，当前情境下必须清楚的能力、偏好记忆
     2.与新的消息直接或间接有关的记忆
     3.有些记忆是在当下重要的，有些虽然重要但是回答时候并不一定需要参考因此不用选择
     4.激活的记忆总数不要超过10个
     5.若没有任何需要被激活的记忆，输出序号中输出[]空的即可
-
-    输出格式：
-    [序号，之间用逗号","隔开]
-    例子:
-    [2,3,19,6,8,12,37......]
     """
     texts = []
     # Handle both batched and single examples
@@ -99,9 +93,11 @@ def formatting_prompts_func(examples):
         output_item = examples["activated_memory"][i] if isinstance(examples["activated_memory"], list) else examples["activated_memory"]
         
         messages = [
+            {"role": "user", "content": chat_item + "\n memories:" + memory_item},
             {"role": "system", "content": instruction},
-            {"role": "user", "content": chat_item + "\n memories:" + memory_item +"\n next message:" + message_item},
-            {"role": "assistant", "content": think_item+ "\nso the chosen memoryires are:" + output_item},
+            {"role": "user", "content": "next message:" + message_item},
+            #{"role": "assistant", "content": think_item+ "\nso the chosen memoryires are:" + output_item},
+            {"role": "assistant", "content": output_item},
         ]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False) + EOS_TOKEN
         texts.append(text)
