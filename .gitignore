@@ -13,3 +13,4 @@ audio.wav
 chat_output.wav
 chat_output_fast.wav
 tts_queue/*
+chat_output_final.wav

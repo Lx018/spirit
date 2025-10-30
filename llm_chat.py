@@ -7,6 +7,7 @@ from pathlib import Path
 import multiprocessing
 import subprocess
 import sys
+import argparse
 
 # ANSI color codes
 GREEN = '\033[92m'
@@ -108,18 +109,26 @@ def write_sentence_to_queue(sentence, index):
     sentence_counter += 1
 
 
-def start_tts_engine():
+def start_tts_engine(debug=False):
     """Start the TTS engine as a subprocess."""
     tts_script = os.path.join(os.path.dirname(__file__), "tts_engine.py")
     
-    # Start TTS engine as subprocess
-    process = subprocess.Popen(
-        [sys.executable, tts_script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1
-    )
+    if debug:
+        # Start TTS engine with output visible
+        process = subprocess.Popen(
+            [sys.executable, tts_script],
+            stdout=None,  # Don't capture stdout, let it print to terminal
+            stderr=None,  # Don't capture stderr, let it print to terminal
+            text=True
+        )
+    else:
+        # Start TTS engine with output hidden
+        process = subprocess.Popen(
+            [sys.executable, tts_script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
     
     return process
 
@@ -143,12 +152,19 @@ def stop_tts_engine(process):
 
 
 def main():
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Interactive LLM Chat with TTS (Spirit VTuber)')
+    parser.add_argument('--debug', action='store_true', help='Show TTS engine debug output')
+    args = parser.parse_args()
+    
     print("=" * 60)
     print("Interactive LLM Chat (Spirit VTuber)")
     print("=" * 60)
     print(f"Using model: {MODEL_PATH}")
     print(f"TTS Queue: {QUEUE_DIR}")
     print(f"GPU layers: {N_GPU_LAYERS}")
+    if args.debug:
+        print("Debug mode: ON (TTS output visible)")
     print("=" * 60)
     print("Type your message and press Enter.")
     print("TTS engine will start automatically.")
@@ -166,7 +182,7 @@ def main():
     
     # Start TTS engine process
     print("\n[Main] Starting TTS engine...")
-    tts_process = start_tts_engine()
+    tts_process = start_tts_engine(debug=args.debug)
     time.sleep(2)  # Give TTS time to initialize
     print("[Main] TTS engine started!\n")
     
