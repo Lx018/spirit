@@ -13,7 +13,7 @@ from scipy import signal as scipy_signal
 
 # Configuration
 TTS_MODEL = "tts_models/en/jenny/jenny"
-QUEUE_DIR = "/home/itx/Desktop/spirit/tts_queue"
+QUEUE_DIR = "tts_queue"
 OUTPUT_FILE = "chat_output.wav"
 OUTPUT_FILE_FAST = "chat_output_fast.wav"
 OUTPUT_FILE_FINAL = "chat_output_final.wav"
@@ -149,7 +149,7 @@ def speak_text(text):
         
         # Play the final processed audio
         print(f"[DEBUG] Playing: {final_output}")
-        players = ['paplay', 'aplay', 'ffplay', 'mpg123']
+        players = ['afplay', 'paplay', 'aplay', 'ffplay', 'mpg123']
         for player in players:
             if subprocess.run(['which', player], capture_output=True).returncode == 0:
                 if player == 'ffplay':

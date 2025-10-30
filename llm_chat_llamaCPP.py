@@ -15,8 +15,8 @@ RESET = '\033[0m'
 BOLD = '\033[1m'
 
 # Configuration
-MODEL_PATH = "/home/itx/Desktop/spirit/memory/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
-QUEUE_DIR = "/home/itx/Desktop/spirit/tts_queue"
+MODEL_PATH = "Qwen3-8B-Q4_K_M.gguf"
+QUEUE_DIR = "tts_queue"
 
 # LLM Parameters
 N_CTX = 4096  # Context window

@@ -16,8 +16,8 @@ RESET = '\033[0m'
 BOLD = '\033[1m'
 
 # Configuration
-MODEL_PATH = "/home/itx/Desktop/spirit/memory/Qwen8B"  # Update to your Transformers model path
-QUEUE_DIR = "/home/itx/Desktop/spirit/tts_queue"
+MODEL_PATH = "Qwen8B"  # Update to your Transformers model path
+QUEUE_DIR = "tts_queue"
 
 # LLM Parameters
 MAX_NEW_TOKENS = 512
