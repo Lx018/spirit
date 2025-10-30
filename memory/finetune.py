@@ -74,7 +74,7 @@ model = FastLanguageModel.get_peft_model(
 # 5. Define the trainer
 EOS_TOKEN = tokenizer.eos_token # Must add EOS_TOKEN
 def formatting_prompts_func(examples):
-    instruction = """你是大脑中的记忆单元调度中枢，负责处理哪些记忆会被唤醒。你需要根据聊天记录、新的消息，来筛选出哪些关于能力与偏好的记忆是对回答新的消息有帮助、或对角色应对此时此刻下一秒的情景是有用的，并将消息的序号返回到activated_memory。注意，在思考<think>中不要输出超过2000token，思考尽量精简。
+    instruction = """你是大脑中的记忆单元调度中枢，负责处理哪些记忆会被唤醒。你需要根据聊天记录、新的消息，来筛选出哪些关于能力与偏好的记忆是对回答新的消息有帮助、或对角色应对此时此刻下一秒的情景是有用的，并将消息的序号返回到activated_memory。注意，在思考<think>中不要输出超过500token，思考尽量精简。
     现在请根据以下规则进行筛选：
     1.为了更好扮演角色，当前情境下必须清楚的能力、偏好记忆
     2.与新的消息直接或间接有关的记忆
