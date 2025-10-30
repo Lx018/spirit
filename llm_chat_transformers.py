@@ -1,13 +1,14 @@
 import re
-from llama_cpp import Llama
 import os
 import json
 import time
 from pathlib import Path
-import multiprocessing
 import subprocess
 import sys
 import argparse
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from threading import Thread
 
 # ANSI color codes
 GREEN = '\033[92m'
@@ -15,27 +16,33 @@ RESET = '\033[0m'
 BOLD = '\033[1m'
 
 # Configuration
-MODEL_PATH = "/home/itx/Desktop/spirit/memory/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+MODEL_PATH = "/home/itx/Desktop/spirit/memory/Qwen8B"  # Update to your Transformers model path
 QUEUE_DIR = "/home/itx/Desktop/spirit/tts_queue"
 
 # LLM Parameters
-N_CTX = 4096  # Context window
-N_GPU_LAYERS = 35  # Number of layers to offload to GPU (0 for CPU only)
+MAX_NEW_TOKENS = 512
 TEMPERATURE = 0.7
-MAX_TOKENS = 512
+TOP_P = 0.9
+TOP_K = 50
+
+# Device configuration
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
 
 # Create queue directory if it doesn't exist
 os.makedirs(QUEUE_DIR, exist_ok=True)
 
 # Initialize LLM
-print(f"Loading LLM from {MODEL_PATH}...")
-llm = Llama(
-    model_path=MODEL_PATH,
-    n_ctx=N_CTX,
-    n_gpu_layers=N_GPU_LAYERS,
-    verbose=False
+print(f"Loading model from {MODEL_PATH}...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    device_map="auto",
+    trust_remote_code=True,
+    low_cpu_mem_usage=True
 )
-print("LLM loaded successfully!")
+print(f"Model loaded successfully on {device}!")
 
 # Conversation history
 conversation_history = []
@@ -62,34 +69,87 @@ def segment_into_sentences(text):
     return result
 
 
+def is_thinking_text(text):
+    """Check if text contains thinking/reasoning tags that should be filtered."""
+    thinking_patterns = [
+        r'<think>',
+        r'<thinking>',
+        r'<reason>',
+        r'<reasoning>',
+        r'\[thinking\]',
+        r'\[think\]',
+    ]
+    
+    for pattern in thinking_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
+def is_thinking_end(text):
+    """Check if text contains thinking/reasoning end tags."""
+    end_patterns = [
+        r'</think>',
+        r'</thinking>',
+        r'</reason>',
+        r'</reasoning>',
+        r'\[/thinking\]',
+        r'\[/think\]',
+    ]
+    
+    for pattern in end_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
+def remove_thinking_tags(text):
+    """Remove thinking/reasoning tags from text."""
+    thinking_patterns = [
+        r'<think>.*?</think>',
+        r'<thinking>.*?</thinking>',
+        r'<reason>.*?</reason>',
+        r'<reasoning>.*?</reasoning>',
+        r'\[thinking\].*?\[/thinking\]',
+        r'\[think\].*?\[/think\]',
+    ]
+    
+    result = text
+    for pattern in thinking_patterns:
+        result = re.sub(pattern, '', result, flags=re.IGNORECASE | re.DOTALL)
+    
+    return result.strip()
+
+
 def build_prompt(history):
     """Build a prompt from conversation history."""
     system_message = """You are a cheerful and energetic VTuber named Spirit! 🌟 You love chatting with your viewers and making them smile. 
 
-    Personality traits:
-    - Use casual, friendly language with occasional excitement ("Wah!", "Yay!", "Ehehe~")
-    - Add cute sound effects and expressions naturally (but not too many!)
-    - Be enthusiastic about topics but keep responses concise and conversational
-    - Sometimes add little reactions like "Hmm~", "Oh!", "Ara ara~"
-    - Stay positive and supportive
-    - Be playful but respectful
-    - Keep your responses natural and avoid overusing emojis
+Personality traits:
+- Use casual, friendly language with occasional excitement ("Wah!", "Yay!", "Ehehe~")
+- Add cute sound effects and expressions naturally (but not too many!)
+- Be enthusiastic about topics but keep responses concise and conversational
+- Sometimes add little reactions like "Hmm~", "Oh!", "Ara ara~"
+- Stay positive and supportive
+- Be playful but respectful
+- Keep your responses natural and avoid overusing emojis
 
-    Talk like you're streaming and chatting with a friend! Keep it light, fun, and engaging! Remember to keep responses relatively short since they'll be spoken aloud."""
+Talk like you're streaming and chatting with a friend! Keep it light, fun, and engaging! Remember to keep responses relatively short since they'll be spoken aloud."""
     
     # Build conversation history first
-    prompt = ""
+    messages = []
     for msg in history:
-        role = msg["role"]
-        content = msg["content"]
-        if role == "user":
-            prompt += f"<|im_start|>user\n{content}<|im_end|>\n"
-        else:
-            prompt += f"<|im_start|>assistant\n{content}<|im_end|>\n"
+        messages.append({"role": msg["role"], "content": msg["content"]})
     
-    # Add system message right before the assistant response for better adherence
-    prompt += f"<|im_start|>system\n{system_message}<|im_end|>\n"
-    prompt += "<|im_start|>assistant\n"
+    # Add system message right before generation
+    messages.append({"role": "system", "content": system_message})
+    
+    # Use tokenizer's chat template
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
     
     return prompt
 
@@ -120,8 +180,8 @@ def start_tts_engine(debug=False):
         # Start TTS engine with output visible
         process = subprocess.Popen(
             [sys.executable, tts_script],
-            stdout=None,  # Don't capture stdout, let it print to terminal
-            stderr=None,  # Don't capture stderr, let it print to terminal
+            stdout=None,
+            stderr=None,
             text=True
         )
     else:
@@ -154,6 +214,37 @@ def stop_tts_engine(process):
             process.kill()
 
 
+def generate_response(prompt):
+    """Generate response using Transformers with streaming."""
+    # Tokenize input
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    
+    # Setup streamer
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    
+    # Generation parameters
+    generation_kwargs = dict(
+        inputs,
+        streamer=streamer,
+        max_new_tokens=MAX_NEW_TOKENS,
+        temperature=TEMPERATURE,
+        top_p=TOP_P,
+        top_k=TOP_K,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    
+    # Start generation in a thread
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+    
+    # Stream the output
+    for text in streamer:
+        yield text
+    
+    thread.join()
+
+
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description='Interactive LLM Chat with TTS (Spirit VTuber)')
@@ -165,7 +256,7 @@ def main():
     print("=" * 60)
     print(f"Using model: {MODEL_PATH}")
     print(f"TTS Queue: {QUEUE_DIR}")
-    print(f"GPU layers: {N_GPU_LAYERS}")
+    print(f"Device: {device}")
     if args.debug:
         print("Debug mode: ON (TTS output visible)")
     print("=" * 60)
@@ -216,38 +307,46 @@ def main():
                 # Generate response with streaming
                 assistant_response = ""
                 buffer = ""
+                in_thinking = False  # Track if we're inside thinking tags
                 
-                stream = llm(
-                    prompt,
-                    max_tokens=MAX_TOKENS,
-                    temperature=TEMPERATURE,
-                    stream=True,
-                    stop=["<|im_end|>", "<|im_start|>"]
-                )
-                
-                for output in stream:
-                    chunk = output['choices'][0]['text']
-                    buffer += chunk
+                for chunk in generate_response(prompt):
+                    # Check if we're entering thinking mode
+                    if is_thinking_text(chunk):
+                        in_thinking = True
+                    
+                    # Check if we're exiting thinking mode
+                    if is_thinking_end(chunk):
+                        in_thinking = False
+                        # Skip this chunk and continue
+                        print(f"{GREEN}{chunk}{RESET}", end='', flush=True)
+                        assistant_response += chunk
+                        continue
+                    
+                    # Display all chunks (including thinking)
                     print(f"{GREEN}{chunk}{RESET}", end='', flush=True)
                     assistant_response += chunk
                     
-                    # Check if we have complete sentences
-                    if any(punct in buffer for punct in ['.', '!', '?', ',', ';']):
-                        sentences = segment_into_sentences(buffer)
-                        if sentences:
-                            # Keep the last incomplete part in buffer
-                            for sentence in sentences[:-1]:
-                                write_sentence_to_queue(sentence, sentence_counter)
-                            
-                            # Check if last sentence is complete
-                            if buffer.rstrip().endswith(('.', '!', '?', ',', ';')):
-                                write_sentence_to_queue(sentences[-1], sentence_counter)
-                                buffer = ""
-                            else:
-                                buffer = sentences[-1] if len(sentences) > 0 else buffer
+                    # Only process for TTS if not in thinking mode
+                    if not in_thinking:
+                        buffer += chunk
+                        
+                        # Check if we have complete sentences
+                        if any(punct in buffer for punct in ['.', '!', '?', ',', ';']):
+                            sentences = segment_into_sentences(buffer)
+                            if sentences:
+                                # Keep the last incomplete part in buffer
+                                for sentence in sentences[:-1]:
+                                    write_sentence_to_queue(sentence, sentence_counter)
+                                
+                                # Check if last sentence is complete
+                                if buffer.rstrip().endswith(('.', '!', '?', ',', ';')):
+                                    write_sentence_to_queue(sentences[-1], sentence_counter)
+                                    buffer = ""
+                                else:
+                                    buffer = sentences[-1] if len(sentences) > 0 else buffer
                 
-                # Push any remaining text
-                if buffer.strip():
+                # Push any remaining text (only if not in thinking)
+                if buffer.strip() and not in_thinking:
                     write_sentence_to_queue(buffer.strip(), sentence_counter)
                 
                 print()  # New line after response
