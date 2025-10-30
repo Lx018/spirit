@@ -11,3 +11,5 @@ memory/api_test_results*
 test/*
 audio.wav
 chat_output.wav
+chat_output_fast.wav
+tts_queue/*

@@ -6,6 +6,9 @@ import queue
 import re
 from llama_cpp import Llama
 import emoji
+import soundfile as sf
+import numpy as np
+from scipy import signal
 
 # ANSI color codes
 GREEN = '\033[92m'
@@ -22,6 +25,9 @@ N_CTX = 4096  # Context window
 N_GPU_LAYERS = 35  # Number of layers to offload to GPU (0 for CPU only)
 TEMPERATURE = 0.7
 MAX_TOKENS = 512
+
+# TTS Parameters
+SPEED_FACTOR = 1.2  # Speed up factor (1.0 = normal, 1.2 = 20% faster, 1.5 = 50% faster)
 
 # Get device for TTS
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,6 +66,23 @@ def remove_emoji(text):
     return text.strip()
 
 
+def speed_up_audio(input_file, output_file, speed_factor=1.2):
+    """Speed up audio using time-stretching."""
+    # Read the audio file
+    data, samplerate = sf.read(input_file)
+    
+    # Calculate new length
+    new_length = int(len(data) / speed_factor)
+    
+    # Resample to speed up (simple method)
+    # This changes both pitch and speed
+    indices = np.linspace(0, len(data) - 1, new_length)
+    resampled_data = np.interp(indices, np.arange(len(data)), data)
+    
+    # Write the sped-up audio
+    sf.write(output_file, resampled_data, samplerate)
+
+
 def segment_into_sentences(text):
     """Split text into sentences by punctuation marks."""
     # Split by . , ! ? ; but keep the punctuation
@@ -82,7 +105,20 @@ def segment_into_sentences(text):
 
 def build_prompt(history):
     """Build a prompt from conversation history."""
-    prompt = "<|im_start|>system\nYou are a helpful AI assistant. Provide clear, concise, and friendly responses.<|im_end|>\n"
+    system_message = """You are a cheerful and energetic VTuber named Spirit! 🌟 You love chatting with your viewers and making them smile. 
+
+    Personality traits:
+    - Use casual, friendly language with occasional excitement ("Wah!", "Yay!", "Ehehe~")
+    - Add cute sound effects and expressions naturally (but not too many!)
+    - Be enthusiastic about topics but keep responses concise and conversational
+    - Sometimes add little reactions like "Hmm~", "Oh!", "Ara ara~"
+    - Stay positive and supportive
+    - Be playful but respectful
+    - Keep your responses natural and avoid overusing emojis
+
+    Talk like you're streaming and chatting with a friend! Keep it light, fun, and engaging! Remember to keep responses relatively short since they'll be spoken aloud."""
+    
+    prompt = f"<|im_start|>system\n{system_message}<|im_end|>\n"
     
     for msg in history:
         role = msg["role"]
@@ -197,15 +233,19 @@ def tts_thread_func():
                 
             tts.tts_to_file(text=clean_sentence, file_path=OUTPUT_FILE)
             
+            # Speed up the audio
+            sped_up_file = "chat_output_fast.wav"
+            speed_up_audio(OUTPUT_FILE, sped_up_file, SPEED_FACTOR)
+            
             # Play audio
             players = ['paplay', 'aplay', 'ffplay', 'mpg123']
             for player in players:
                 if subprocess.run(['which', player], capture_output=True).returncode == 0:
                     if player == 'ffplay':
-                        subprocess.run([player, '-nodisp', '-autoexit', OUTPUT_FILE], 
+                        subprocess.run([player, '-nodisp', '-autoexit', sped_up_file], 
                                      capture_output=True)
                     else:
-                        subprocess.run([player, OUTPUT_FILE], capture_output=True)
+                        subprocess.run([player, sped_up_file], capture_output=True)
                     break
             
             sentence_queue.task_done()
