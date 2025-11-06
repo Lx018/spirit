@@ -432,3 +432,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#python train_t.py -e 10000 -b 30 -lr 3e-4 -c

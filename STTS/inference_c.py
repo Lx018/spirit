@@ -1,5 +1,6 @@
 """
-Inference script for Timing-based TTS Model
+Inference script with word timing control (inference_c.py)
+Loads JSON files with word timing and generates speech with precise timing control
 """
 import torch
 import torchaudio
@@ -14,32 +15,30 @@ from data_processor_t import TimingDataProcessor
 
 # Try to import neural vocoders
 try:
-    from vocos import Vocos
-    VOCOS_AVAILABLE = True
-except ImportError:
-    VOCOS_AVAILABLE = False
-
-try:
     import librosa
     LIBROSA_AVAILABLE = True
 except ImportError:
     LIBROSA_AVAILABLE = False
-    print("⚠️  Vocos not available. Install with: pip install vocos")
-    print("   Falling back to Griffin-Lim (lower quality)")
 
 
-class TimingTTSInference:
-    """Inference class for timing-based TTS"""
+class ControlledTimingInference:
+    """Timing-controlled TTS inference using JSON timing files"""
     
-    def __init__(self, checkpoint_path: str, vocab_path: str, device: str = "cuda", use_vocoder: str = "vocos"):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        vocab_path: str,
+        device: str = "cuda",
+        use_vocoder: str = "griffin-lim"
+    ):
         """
-        Initialize inference
+        Initialize controlled inference
         
         Args:
             checkpoint_path: Path to model checkpoint
             vocab_path: Path to vocabulary JSON
             device: cuda or cpu
-            use_vocoder: 'vocos' (neural vocoder) or 'griffin-lim' (traditional)
+            use_vocoder: 'hifigan' (neural vocoder) or 'griffin-lim' (traditional)
         """
         self.device = device if torch.cuda.is_available() else "cpu"
         self.use_vocoder = use_vocoder
@@ -92,66 +91,89 @@ class TimingTTSInference:
         else:
             print(f"\nUsing Griffin-Lim vocoder (basic quality)")
     
-    def text_to_speech(
+    def load_timing_json(self, json_path: str) -> dict:
+        """
+        Load timing JSON file
+        
+        Returns:
+            {
+                'transcript': str,
+                'words': [{'word': str, 'start': float, 'end': float}, ...]
+            }
+        """
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        
+        return data
+    
+    def json_to_speech(
         self,
-        text: str,
+        json_path: str,
         output_path: str,
-        target_frames: int = None,
         speed: float = 1.0
     ):
         """
-        Convert text to speech
+        Generate speech from JSON timing file
         
         Args:
-            text: Input text
+            json_path: Path to JSON file with timing
             output_path: Path to save output audio
-            target_frames: Number of frames to generate (auto if None)
-            speed: Speed multiplier (1.0 = normal, >1 = faster, <1 = slower)
+            speed: Speed multiplier (1.0=original timing, >1=faster, <1=slower)
         """
-        print(f"\nGenerating speech for: '{text}'")
+        # Load timing data
+        print(f"\nLoading timing from {json_path}...")
+        timing_data = self.load_timing_json(json_path)
         
-        # Convert text to tokens
-        text_tokens = self.processor.text_to_tokens(text)
+        text = timing_data.get('transcript') or timing_data.get('text', '')
+        words = timing_data.get('words', [])
         
-        if len(text_tokens) == 0:
-            print("ERROR: No valid tokens in text")
-            return
+        print(f"Text: '{text}'")
+        print(f"Words: {len(words)}")
         
-        # Estimate target frames if not provided
-        if target_frames is None:
-            # Rough estimate: ~10 frames per word
-            num_words = len(text.split())
-            target_frames = int(num_words * 10 / speed)
+        # Tokenize text
+        tokens = self.processor.text_to_tokens(text)
+        
+        # Calculate total duration and frames
+        if words:
+            total_duration = words[-1]['end'] / speed
+            total_frames = int(total_duration * SAMPLE_RATE / HOP_LENGTH)
         else:
-            target_frames = int(target_frames / speed)
+            total_frames = len(tokens) * 5  # Fallback: 5 frames per token
         
-        print(f"  Tokens: {text_tokens.tolist()}")
-        print(f"  Target frames: {target_frames}")
+        print(f"Target duration: {total_duration:.2f}s")
+        print(f"Target frames: {total_frames}")
+        
+        # Create word_indices mapping (frame -> word index)
+        word_indices = torch.zeros(total_frames, dtype=torch.long)
+        
+        current_word_idx = 0
+        for i, word_info in enumerate(words):
+            start_frame = int(word_info['start'] / speed * SAMPLE_RATE / HOP_LENGTH)
+            end_frame = int(word_info['end'] / speed * SAMPLE_RATE / HOP_LENGTH)
+            
+            # Map frames to word index
+            word_indices[start_frame:min(end_frame, total_frames)] = i + 1  # +1 because 0 is padding
+        
+        # Prepare inputs (tokens is already a tensor)
+        token_ids = tokens.unsqueeze(0).to(self.device)  # [1, seq_len]
+        word_indices_tensor = word_indices.unsqueeze(0).to(self.device)  # [1, frames]
         
         # Generate mel spectrogram
+        print(f"Generating mel spectrogram...")
         with torch.no_grad():
-            text_tokens = text_tokens.unsqueeze(0).to(self.device)
-            
             output = self.model(
-                text_tokens,
-                target_frames=target_frames
+                token_ids,
+                word_indices_tensor,
+                target_frames=total_frames
             )
-            
-            mel_pred = output['mel_pred'].squeeze(0)  # [n_mels, num_frames]
-            stop_tokens = output['stop_tokens'].squeeze(0)  # [num_frames]
         
-        # Find actual end (based on stop tokens)
-        stop_probs = torch.sigmoid(stop_tokens)
-        stop_idx = (stop_probs > 0.5).nonzero(as_tuple=True)[0]
-        if len(stop_idx) > 0:
-            end_frame = stop_idx[0].item()
-            mel_pred = mel_pred[:, :end_frame]
-            print(f"  Actual frames: {end_frame} (stopped early)")
-        else:
-            print(f"  Actual frames: {mel_pred.shape[1]} (no stop)")
+        # Extract mel from output dict
+        mel_pred = output['mel_pred'].squeeze(0)  # [n_mels, frames]
+        
+        print(f"  Generated {mel_pred.shape[1]} frames")
+        print(f"  Converting mel to audio...")
         
         # Convert mel to audio
-        print(f"  Converting mel to audio...")
         audio = self.mel_to_audio(mel_pred)
         
         # Save audio
@@ -214,59 +236,70 @@ class TimingTTSInference:
     
     def batch_generate(
         self,
-        text_file: str,
+        json_dir: str,
         output_dir: str,
-        target_frames: int = None
+        speed: float = 1.0,
+        pattern: str = "*.json"
     ):
         """
-        Generate speech for multiple texts from a file
+        Generate speech for all JSON files in directory
         
         Args:
-            text_file: Path to text file (one sentence per line)
+            json_dir: Directory containing JSON timing files
             output_dir: Directory to save output audio files
-            target_frames: Target frames per utterance
+            speed: Speed multiplier for all files
+            pattern: File pattern to match (default: *.json)
         """
-        output_path = Path(output_dir)
-        output_path.mkdir(exist_ok=True, parents=True)
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
         
-        with open(text_file, 'r', encoding='utf-8') as f:
-            texts = [line.strip() for line in f if line.strip()]
+        # Find all JSON files
+        json_files = sorted(Path(json_dir).glob(pattern))
         
-        print(f"\n{'='*60}")
-        print(f"Batch generation: {len(texts)} utterances")
-        print(f"{'='*60}\n")
+        print(f"\nFound {len(json_files)} JSON files")
+        print(f"Output directory: {output_dir}")
+        print(f"Speed: {speed}x")
+        print()
         
-        for i, text in enumerate(texts, 1):
-            output_file = output_path / f"{i:03d}.wav"
-            print(f"[{i}/{len(texts)}]", end=" ")
-            self.text_to_speech(text, str(output_file), target_frames)
+        # Process each file
+        for i, json_path in enumerate(json_files, 1):
+            print(f"[{i}/{len(json_files)}] Processing {json_path.name}...")
+            
+            # Output path: same name but .wav extension
+            output_name = json_path.stem + ".wav"
+            output_path = os.path.join(output_dir, output_name)
+            
+            try:
+                self.json_to_speech(
+                    json_path=str(json_path),
+                    output_path=output_path,
+                    speed=speed
+                )
+            except Exception as e:
+                print(f"  ⚠️  Error: {e}")
+                continue
         
-        print(f"\n{'='*60}")
-        print(f"✓ Generated {len(texts)} audio files in {output_dir}")
-        print(f"{'='*60}\n")
+        print(f"\n✓ Batch generation complete: {len(json_files)} files")
 
 
 def main():
-    """Main inference function"""
-    parser = argparse.ArgumentParser(description="Timing-based TTS Inference")
-    parser.add_argument("--checkpoint", type=str, 
+    parser = argparse.ArgumentParser(description="Controlled TTS Inference with Word Timing")
+    parser.add_argument("--checkpoint", type=str,
                        default=os.path.join(CHECKPOINT_DIR, "best_model_timing.pt"),
                        help="Path to model checkpoint")
     parser.add_argument("--vocab", type=str,
                        default=os.path.join(OUTPUT_DIR, "vocab_timing.json"),
                        help="Path to vocabulary JSON")
-    parser.add_argument("--text", type=str, default=None,
-                       help="Text to synthesize")
-    parser.add_argument("--text-file", type=str, default=None,
-                       help="File with multiple texts (one per line)")
-    parser.add_argument("--output", type=str, default="output_timing.wav",
-                       help="Output audio file path")
-    parser.add_argument("--output-dir", type=str, default="outputs/batch_timing",
-                       help="Output directory for batch generation")
-    parser.add_argument("--frames", type=int, default=None,
-                       help="Target number of frames (auto if not specified)")
+    parser.add_argument("--json", type=str, default=None,
+                       help="JSON timing file to synthesize")
+    parser.add_argument("--json-dir", type=str, default=None,
+                       help="Directory with multiple JSON timing files")
+    parser.add_argument("--output", type=str, default="output_controlled.wav",
+                       help="Output audio file path (for single file)")
+    parser.add_argument("--output-dir", type=str, default="outputs/controlled",
+                       help="Output directory (for batch generation)")
     parser.add_argument("--speed", type=float, default=1.0,
-                       help="Speed multiplier (1.0=normal, >1=faster, <1=slower)")
+                       help="Speed multiplier (1.0=original timing, >1=faster, <1=slower)")
     parser.add_argument("--device", type=str, default=DEVICE,
                        help="Device to use: cuda or cpu")
     parser.add_argument("--vocoder", type=str, default="griffin-lim",
@@ -276,17 +309,16 @@ def main():
     args = parser.parse_args()
     
     # Check inputs
-    if not args.text and not args.text_file:
-        print("ERROR: Please provide either --text or --text-file")
-        parser.print_help()
+    if not args.json and not args.json_dir:
+        print("Error: Must specify either --json or --json-dir")
         return
     
     print("=" * 60)
-    print("Timing-based TTS Inference")
+    print("Controlled Timing-based TTS Inference")
     print("=" * 60)
     
     # Initialize inference
-    inference = TimingTTSInference(
+    inference = ControlledTimingInference(
         checkpoint_path=args.checkpoint,
         vocab_path=args.vocab,
         device=args.device,
@@ -294,23 +326,24 @@ def main():
     )
     
     # Generate speech
-    if args.text:
-        # Single text
-        inference.text_to_speech(
-            text=args.text,
+    if args.json:
+        # Single JSON file
+        inference.json_to_speech(
+            json_path=args.json,
             output_path=args.output,
-            target_frames=args.frames,
             speed=args.speed
         )
-    elif args.text_file:
+    elif args.json_dir:
         # Batch generation
         inference.batch_generate(
-            text_file=args.text_file,
+            json_dir=args.json_dir,
             output_dir=args.output_dir,
-            target_frames=args.frames
+            speed=args.speed
         )
     
-    print("\n✓ Inference complete!")
+    print("\n" + "=" * 60)
+    print("Done!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

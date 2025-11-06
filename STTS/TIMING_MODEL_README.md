@@ -1,46 +1,61 @@
-# Timing-based TTS Model
+# Timing-based TTS Model (Simplified)
 
-This is a simplified TTS approach that uses **explicit word timing labels** instead of expensive attention mechanisms.
+This is a **simplified TTS approach** based on the successful StudentTTSModel architecture. It uses **explicit word timing labels** instead of expensive attention mechanisms, while keeping the fast sentence encoding that works well.
 
-## Key Differences from Attention-based Model
+## Key Philosophy
 
-### Original Model (model.py + train.py)
-- ❌ Uses Location-Sensitive Attention (expensive, hard to train)
-- ❌ Must learn alignment from scratch
-- ❌ Prone to repetition/skipping issues
-- ✅ Works without timing labels
-
-### New Timing-based Model (model_t.py + train_t.py)
-- ✅ Uses explicit word timing from WhisperX
-- ✅ No attention mechanism (simpler, faster)
-- ✅ Direct word-to-frame mapping
-- ✅ Sentence-level embedding for context
-- ❌ Requires timing labels (from speech_timing_tagger.py)
+✅ **Keep what works:** Simple embeddings + mean pooling (fast & effective!)  
+✅ **Add timing supervision:** Use WhisperX word-level labels  
+❌ **Remove complexity:** No transformers, no attention (they're slow and hard to train)
 
 ## Architecture
 
-Each mel frame is conditioned on:
-1. **One-hot word vector** - Which word this frame belongs to
-2. **Sentence-level embedding** - Global context for prosody
-3. **Previous mel frame** - Autoregressive smoothness
-
 ```
-Input: "hello world"
+Input: "hello world" + timing labels
        ↓
    Word Embeddings [hello, world]
        ↓
-   Transformer Encoder (context)
+   Mean Pooling → Sentence Embedding (global context)
        ↓
-   ┌─────────────────────────────┐
-   │ Word Embedding  (per frame) │
-   │ + Sentence Embedding        │
-   │ + Previous Mel Frame        │
-   └─────────────────────────────┘
+   For each frame:
+   ┌─────────────────────────────────────┐
+   │ Word Embedding[word_idx]  (timing)  │
+   │ + Sentence Embedding     (context)  │
+   │ + Mel Prenet(prev_frame) (smooth)   │
+   └─────────────────────────────────────┘
        ↓
    LSTM Decoder (autoregressive)
        ↓
-   Mel Spectrogram Output
+   Mel Frame + Stop Token
 ```
+
+### Compared to Original StudentTTSModel
+
+| Component | StudentTTSModel | Timing-based Model |
+|-----------|----------------|-------------------|
+| Text Encoding | ✅ Simple embeddings | ✅ Simple embeddings |
+| Sentence Context | ✅ Mean pooling | ✅ Mean pooling |
+| Per-frame Info | ❌ Same for all frames | ✅ Word embedding (from timing) |
+| Autoregressive | ✅ LSTM + prenet | ✅ LSTM + prenet |
+| Training | Fast ⚡ | Fast ⚡ |
+| Parameters | ~4.5M | **~1.5M** (3x smaller!) |
+
+## Why This Works
+
+1. **Sentence embedding works!** Mean pooling gives great global context
+2. **Word timing adds precision** Each frame knows which word to generate
+3. **No attention needed** Direct supervision from timing labels
+4. **Keeps it simple** No transformers = faster training
+
+## Comparison
+
+| Feature | Attention-based | Timing-based (Old) | Timing-based (New) |
+|---------|----------------|--------------------|--------------------|
+| Training Speed | Slow 🐌 | Fast ⚡ | **Faster ⚡⚡** |
+| Model Size | 4.5M | 5M | **1.5M** |
+| Complexity | High | Medium | **Low** |
+| Needs Timing? | No | Yes | Yes |
+| Stability | Can repeat/skip | Stable | **Very Stable** |
 
 ## Workflow
 
