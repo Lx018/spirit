@@ -78,55 +78,27 @@ class TTSDataProcessor:
         mel: torch.Tensor
     ) -> List[Dict[str, torch.Tensor]]:
         """
-        Create training chunks with lookahead context
+        Create training samples (full sentence -> mel spectrogram)
+        No word chunking, no lookahead - simple text-to-wav
         
         Args:
-            text: Input text string
+            text: Input text string (full sentence)
             mel: Mel spectrogram [n_mels, time_frames]
             
         Returns:
-            List of dicts with 'text_tokens', 'mel_target', 'word_idx'
+            List with single dict containing full sentence tokens and mel
         """
         words = text.strip().lower().split()
-        num_words = len(words)
-        num_frames = mel.shape[1]
         
-        # Estimate frames per word (simple uniform alignment)
-        frames_per_word = num_frames / num_words
+        # Convert full sentence to tokens (no lookahead)
+        text_tokens = [self.word2idx.get(w, self.word2idx[PAD_TOKEN]) for w in words]
         
-        chunks = []
-        
-        for word_idx in range(num_words):
-            # Get current word + lookahead words
-            context_words = []
-            for i in range(word_idx, min(word_idx + LOOKAHEAD_WORDS + 1, num_words)):
-                context_words.append(words[i])
-            
-            # Convert to tokens
-            text_tokens = [self.word2idx.get(w, self.word2idx[PAD_TOKEN]) 
-                          for w in context_words]
-            
-            # Pad if needed
-            while len(text_tokens) < LOOKAHEAD_WORDS + 1:
-                text_tokens.append(self.word2idx[PAD_TOKEN])
-            
-            # Get corresponding mel frames for current word
-            start_frame = int(word_idx * frames_per_word)
-            end_frame = int((word_idx + 1) * frames_per_word)
-            
-            if end_frame > num_frames:
-                end_frame = num_frames
-            
-            mel_chunk = mel[:, start_frame:end_frame]
-            
-            chunks.append({
-                'text_tokens': torch.tensor(text_tokens, dtype=torch.long),
-                'mel_target': mel_chunk,  # [n_mels, chunk_frames]
-                'word_idx': word_idx,
-                'num_frames': mel_chunk.shape[1]
-            })
-        
-        return chunks
+        # Return single sample with full sentence and full mel
+        return [{
+            'text_tokens': torch.tensor(text_tokens, dtype=torch.long),
+            'mel_target': mel,  # [n_mels, total_frames]
+            'num_frames': mel.shape[1]
+        }]
     
     def process_file_pair(self, txt_path: str, wav_path: str) -> List[Dict]:
         """Process a text-audio pair into training chunks"""

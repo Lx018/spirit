@@ -47,24 +47,10 @@ class TTSInference:
         print(f"Device: {self.device}")
     
     def text_to_tokens(self, text: str) -> torch.Tensor:
-        """Convert text to tokens with lookahead"""
+        """Convert text to tokens (simple, no lookahead)"""
         words = text.strip().lower().split()
-        all_tokens = []
-        
-        for i in range(len(words)):
-            # Current word + lookahead
-            context = []
-            for j in range(i, min(i + LOOKAHEAD_WORDS + 1, len(words))):
-                context.append(words[j])
-            
-            # Pad if needed
-            while len(context) < LOOKAHEAD_WORDS + 1:
-                context.append(self.word2idx[PAD_TOKEN])
-            
-            tokens = [self.word2idx.get(w, self.word2idx[PAD_TOKEN]) for w in context]
-            all_tokens.append(tokens)
-        
-        return torch.tensor(all_tokens, dtype=torch.long)
+        tokens = [self.word2idx.get(w, self.word2idx.get(PAD_TOKEN, 0)) for w in words]
+        return torch.tensor([tokens], dtype=torch.long)  # [1, seq_len]
     
     def mel_to_audio(self, mel: torch.Tensor) -> torch.Tensor:
         """
@@ -101,37 +87,33 @@ class TTSInference:
     @torch.no_grad()
     def synthesize(self, text: str, output_path: str = None) -> torch.Tensor:
         """
-        Synthesize speech from text
+        Synthesize speech from text (full sentence, autoregressive)
         
         Args:
-            text: Input text
-            output_path: Optional path to save audio
+            text: Input text string
+            output_path: Path to save audio file
             
         Returns:
-            waveform tensor
+            waveform: Generated audio tensor
         """
-        print(f"Synthesizing: '{text}'")
+        print(f"Synthesizing: {text}")
         
-        # Convert text to tokens
-        tokens = self.text_to_tokens(text)  # [num_words, lookahead+1]
+        # Convert text to tokens (full sentence)
+        tokens = self.text_to_tokens(text).to(self.device)  # [1, seq_len]
         
-        # Generate mel for each word
-        mel_chunks = []
+        # Estimate frames (rough: 1 second per word)
+        num_words = tokens.shape[1]
+        target_frames = min(num_words * 40, 500)  # ~1 second per word at 40 frames/sec
         
-        for word_tokens in tokens:
-            word_tokens = word_tokens.unsqueeze(0).to(self.device)  # [1, lookahead+1]
-            
-            output = self.model(word_tokens, target_frames=50)  # Adjust frames as needed
+        # Generate mel autoregressively
+        with torch.no_grad():
+            output = self.model(tokens, target_frames=target_frames)
             mel = output['mel_pred'].squeeze(0)  # [n_mels, frames]
-            mel_chunks.append(mel)
         
-        # Concatenate all mel chunks
-        full_mel = torch.cat(mel_chunks, dim=1)  # [n_mels, total_frames]
-        
-        print(f"Generated mel shape: {full_mel.shape}")
+        print(f"Generated mel shape: {mel.shape}")
         
         # Convert mel to audio
-        waveform = self.mel_to_audio(full_mel)
+        waveform = self.mel_to_audio(mel)
         
         # Save if requested
         if output_path:

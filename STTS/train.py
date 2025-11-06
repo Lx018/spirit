@@ -12,10 +12,12 @@ import numpy as np
 from typing import List, Dict
 import os
 import torchaudio
+import argparse
 
 from config import *
 from data_processor import TTSDataProcessor
 from model import StudentTTSModel, SimpleCNNTTS
+
 
 
 class TTSDataset(Dataset):
@@ -51,16 +53,21 @@ class TTSDataset(Dataset):
 
 
 def collate_fn(batch):
-    """Custom collate function to handle variable-length mel specs"""
-    text_tokens = torch.stack([item['text_tokens'] for item in batch])
-    
-    # Find max frames in batch
+    """Custom collate function to handle variable-length sequences"""
+    # Find max sequence length and max frames in batch
+    max_seq_len = max(item['text_tokens'].shape[0] for item in batch)
     max_frames = max(item['num_frames'] for item in batch)
     
-    # Pad mel specs to same length
     batch_size = len(batch)
     n_mels = batch[0]['mel_target'].shape[0]
     
+    # Pad text tokens to same length
+    text_tokens = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
+    for i, item in enumerate(batch):
+        seq_len = item['text_tokens'].shape[0]
+        text_tokens[i, :seq_len] = item['text_tokens']
+    
+    # Pad mel specs to same length
     mel_targets = torch.zeros(batch_size, n_mels, max_frames)
     frame_lengths = torch.zeros(batch_size, dtype=torch.long)
     
@@ -84,28 +91,31 @@ class TTSTrainer:
         self,
         model: nn.Module,
         train_loader: DataLoader,
-        val_loader: DataLoader = None,
+        dataset: torch.utils.data.Dataset,
+        processor: TTSDataProcessor,
+        learning_rate: float = 1e-4,
         device: str = "cuda"
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.dataset = dataset  # Store full dataset for generating samples
+        self.processor = processor  # Store processor for vocab access
         self.device = device
         
         # Optimizer
         self.optimizer = optim.AdamW(
             model.parameters(),
-            lr=LEARNING_RATE,
+            lr=learning_rate,
             betas=(0.9, 0.98),
             eps=1e-9
         )
         
-        # Learning rate scheduler
+        # Learning rate scheduler (based on training loss now)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=5
+            patience=10
         )
         
         # Loss function
@@ -114,7 +124,10 @@ class TTSTrainer:
         # Tracking
         self.best_loss = float('inf')
         self.train_losses = []
-        self.val_losses = []
+        
+        # Get first sample for audio generation
+        self.first_sample = dataset[0]
+        print(f"First sample for audio generation: {self.first_sample['text_tokens'].shape}")
     
     def train_epoch(self, epoch: int):
         """Train for one epoch"""
@@ -168,46 +181,6 @@ class TTSTrainer:
         
         return avg_loss
     
-    def validate(self):
-        """Validate the model"""
-        if self.val_loader is None:
-            return None
-        
-        self.model.eval()
-        total_loss = 0
-        
-        with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validation"):
-                text_tokens = batch['text_tokens'].to(self.device)
-                mel_targets = batch['mel_targets'].to(self.device)
-                frame_lengths = batch['frame_lengths']
-                
-                # Forward pass (with teacher forcing for validation too)
-                max_len = mel_targets.shape[2]
-                output = self.model(
-                    text_tokens, 
-                    target_frames=max_len,
-                    mel_targets=mel_targets
-                )
-                mel_pred = output['mel_pred']
-                
-                # Calculate loss
-                loss = 0
-                for i in range(len(frame_lengths)):
-                    valid_len = frame_lengths[i]
-                    loss += self.criterion(
-                        mel_pred[i, :, :valid_len],
-                        mel_targets[i, :, :valid_len]
-                    )
-                loss = loss / len(frame_lengths)
-                
-                total_loss += loss.item()
-        
-        avg_loss = total_loss / len(self.val_loader)
-        self.val_losses.append(avg_loss)
-        
-        return avg_loss
-    
     def save_checkpoint(self, epoch: int, path: str):
         """Save model checkpoint"""
         checkpoint = {
@@ -216,7 +189,6 @@ class TTSTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
             'best_loss': self.best_loss
         }
         torch.save(checkpoint, path)
@@ -228,9 +200,8 @@ class TTSTrainer:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.train_losses = checkpoint['train_losses']
-        self.val_losses = checkpoint['val_losses']
-        self.best_loss = checkpoint['best_loss']
+        self.train_losses = checkpoint.get('train_losses', [])
+        self.best_loss = checkpoint.get('best_loss', float('inf'))
         print(f"Checkpoint loaded from {path}")
         return checkpoint['epoch']
     
@@ -245,21 +216,23 @@ class TTSTrainer:
             train_loss = self.train_epoch(epoch)
             print(f"Epoch {epoch}/{num_epochs} - Train Loss: {train_loss:.4f}")
             
-            # Validate
-            if self.val_loader:
-                val_loss = self.validate()
-                print(f"Epoch {epoch}/{num_epochs} - Val Loss: {val_loss:.4f}")
+            # Learning rate scheduling (based on training loss)
+            self.scheduler.step(train_loss)
+            
+            # Save best model based on training loss
+            if train_loss < self.best_loss:
+                self.best_loss = train_loss
+                checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+                self.save_checkpoint(epoch, checkpoint_path)
                 
-                # Learning rate scheduling
-                self.scheduler.step(val_loss)
-                
-                # Save best model
-                if val_loss < self.best_loss:
-                    self.best_loss = val_loss
-                    self.save_checkpoint(
-                        epoch,
-                        os.path.join(CHECKPOINT_DIR, "best_model.pt")
-                    )
+                # Generate audio from first sample
+                audio_path = os.path.join(OUTPUT_DIR, f"sample_epoch_{epoch}.wav")
+                print(f"Generating sample audio...")
+                self.generate_sample_audio(
+                    self.first_sample['text_tokens'],
+                    audio_path,
+                    target_frames=self.first_sample['num_frames']
+                )
             
             # Save periodic checkpoint
             if epoch % 10 == 0:
@@ -269,12 +242,11 @@ class TTSTrainer:
                 )
         
         print("\nTraining completed!")
-        print(f"Best validation loss: {self.best_loss:.4f}")
+        print(f"Best training loss: {self.best_loss:.4f}")
         
         # Save training history
         history = {
             'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
             'best_loss': self.best_loss
         }
         with open(os.path.join(LOG_DIR, "training_history.json"), 'w') as f:
@@ -285,7 +257,7 @@ class TTSTrainer:
         self.model.eval()
         
         with torch.no_grad():
-            text_tokens = text_tokens.unsqueeze(0).to(self.device)  # [1, lookahead+1]
+            text_tokens = text_tokens.unsqueeze(0).to(self.device)  # [1, seq_len]
             output = self.model(text_tokens, target_frames=target_frames)
             mel_pred = output['mel_pred'].squeeze(0)  # [n_mels, frames]
         
@@ -322,8 +294,27 @@ class TTSTrainer:
 
 def main():
     """Main training function"""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Train Student TTS Model")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                       help=f"Batch size for training (default: {BATCH_SIZE})")
+    parser.add_argument("--learning-rate", "--lr", type=float, default=LEARNING_RATE,
+                       help=f"Learning rate (default: {LEARNING_RATE})")
+    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS,
+                       help=f"Number of epochs (default: {NUM_EPOCHS})")
+    parser.add_argument("--device", type=str, default=DEVICE,
+                       help=f"Device to use: cuda or cpu (default: {DEVICE})")
+    
+    args = parser.parse_args()
+    
     print("=" * 60)
     print("Student TTS Model Training")
+    print("=" * 60)
+    print(f"Configuration:")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Learning rate: {args.learning_rate}")
+    print(f"  Epochs: {args.epochs}")
+    print(f"  Device: {args.device}")
     print("=" * 60)
     
     # Initialize data processor
@@ -340,30 +331,22 @@ def main():
         print(f"Please ensure .txt and .wav files exist in {DATA_DIR}")
         return
     
-    # Split into train/val (90/10)
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, 
-        [train_size, val_size]
-    )
+    print(f"Total samples: {len(dataset)} (using all for training)")
     
-    # Create dataloaders
+    # Use all data for training (no validation split)
+    train_dataset = dataset
+    val_dataset = None
+    
+    # Create dataloader
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=0  # Set to 0 for debugging, increase for faster loading
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0
-    ) if val_size > 0 else None
+    val_loader = None
     
     # Create model
     print("\n3. Creating model...")
@@ -383,8 +366,8 @@ def main():
     print(f"Model parameters: {total_params:,}")
     
     # Check device
-    device = DEVICE if torch.cuda.is_available() else "cpu"
-    if device == "cpu" and DEVICE == "cuda":
+    device = args.device if torch.cuda.is_available() else "cpu"
+    if device == "cpu" and args.device == "cuda":
         print("WARNING: CUDA not available, using CPU")
     print(f"Using device: {device}")
     
@@ -393,23 +376,25 @@ def main():
     trainer = TTSTrainer(
         model=model,
         train_loader=train_loader,
-        val_loader=val_loader,
+        dataset=dataset,
+        processor=processor,
+        learning_rate=args.learning_rate,
         device=device
     )
     
     # Train
     print("\n5. Starting training...")
-    trainer.train(NUM_EPOCHS)
+    trainer.train(args.epochs)
     
-    # Generate sample outputs after training
-    print("\n6. Generating sample outputs...")
+    # Generate final sample outputs after training
+    print("\n6. Generating final sample outputs...")
     os.makedirs(os.path.join(OUTPUT_DIR, "samples"), exist_ok=True)
     
     # Generate audio for first few training samples
     num_samples = min(5, len(dataset))
     for i in range(num_samples):
         sample = dataset[i]
-        output_path = os.path.join(OUTPUT_DIR, "samples", f"predicted_sample_{i+1}.wav")
+        output_path = os.path.join(OUTPUT_DIR, "samples", f"final_sample_{i+1}.wav")
         trainer.generate_sample_audio(
             sample['text_tokens'],
             output_path,

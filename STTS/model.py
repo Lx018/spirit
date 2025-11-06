@@ -28,8 +28,9 @@ class PositionalEncoding(nn.Module):
 class StudentTTSModel(nn.Module):
     """
     Autoregressive TTS Student Model
-    Input: Text tokens with lookahead + previous mel frames
-    Output: Mel spectrogram frames (regression with autoregression)
+    Simple text-to-wav: full sentence -> autoregressive mel generation
+    Input: Text tokens (no lookahead) + previous mel frames
+    Output: Mel spectrogram frames (1 second per frame)
     """
     
     def __init__(
@@ -56,7 +57,7 @@ class StudentTTSModel(nn.Module):
         self.text_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.pos_encoder = PositionalEncoding(hidden_dim)
         
-        # Transformer encoder for text
+        # Transformer encoder for text (encodes full sentence)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -65,15 +66,6 @@ class StudentTTSModel(nn.Module):
             batch_first=True
         )
         self.text_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-        
-        # Duration predictor (predict how many frames for this word)
-        self.duration_predictor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Softplus()  # Ensure positive duration
-        )
         
         # Mel prenet - processes previous mel frames (autoregressive component)
         if use_autoregression:
@@ -88,17 +80,6 @@ class StudentTTSModel(nn.Module):
         else:
             self.mel_prenet = None
             prenet_dim = 0
-        
-        # Mel decoder - predicts mel spectrogram
-        self.mel_decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, n_mels * max_frames),
-        )
         
         # Autoregressive frame decoder (LSTM that takes text encoding + previous mel)
         lstm_input_dim = hidden_dim + prenet_dim if use_autoregression else hidden_dim
@@ -133,12 +114,12 @@ class StudentTTSModel(nn.Module):
         Forward pass with autoregression support
         
         Args:
-            text_tokens: [batch, seq_len] token indices
-            target_frames: Number of frames to generate
+            text_tokens: [batch, seq_len] token indices (full sentence, no lookahead)
+            target_frames: Number of frames to generate (1 second per frame)
             mel_targets: [batch, n_mels, frames] ground truth mels for teacher forcing (training)
             
         Returns:
-            dict with 'mel_pred', 'duration_pred'
+            dict with 'mel_pred'
         """
         batch_size, seq_len = text_tokens.shape
         
@@ -146,47 +127,43 @@ class StudentTTSModel(nn.Module):
         text_emb = self.text_embedding(text_tokens)  # [batch, seq_len, hidden]
         text_emb = self.pos_encoder(text_emb)
         
-        # Encode text
+        # Encode full sentence
         text_encoded = self.text_encoder(text_emb)  # [batch, seq_len, hidden]
         
-        # Predict duration (frames per token)
-        duration_pred = self.duration_predictor(text_encoded)  # [batch, seq_len, 1]
+        # Use mean pooling to get sentence-level encoding
+        sentence_encoding = text_encoded.mean(dim=1)  # [batch, hidden]
         
-        # Use first token's encoding for mel generation (current word)
-        word_encoding = text_encoded[:, 0, :]  # [batch, hidden]
-        
-        # Predict mel frames
+        # Determine target frames (default: estimate based on text length)
         if target_frames is None:
-            target_frames = int(duration_pred[:, 0, 0].mean().item())
-            target_frames = max(1, min(target_frames, self.max_frames))
+            # Rough estimate: 1 second per word
+            target_frames = min(seq_len, self.max_frames)
         
         if self.use_autoregression:
             # Autoregressive generation
             if mel_targets is not None:
                 # Training mode: use teacher forcing
                 mel_pred = self._forward_with_teacher_forcing(
-                    word_encoding, mel_targets, target_frames
+                    sentence_encoding, mel_targets, target_frames
                 )
             else:
                 # Inference mode: autoregressive generation
                 mel_pred = self._forward_autoregressive(
-                    word_encoding, target_frames
+                    sentence_encoding, target_frames
                 )
         else:
             # Non-autoregressive (original) generation
-            word_encoding_expanded = word_encoding.unsqueeze(1).repeat(1, target_frames, 1)
-            frame_hidden, _ = self.frame_decoder(word_encoding_expanded)
+            encoding_expanded = sentence_encoding.unsqueeze(1).repeat(1, target_frames, 1)
+            frame_hidden, _ = self.frame_decoder(encoding_expanded)
             mel_pred = self.frame_to_mel(frame_hidden)  # [batch, frames, n_mels]
             mel_pred = mel_pred.transpose(1, 2)  # [batch, n_mels, frames]
         
         return {
             'mel_pred': mel_pred,
-            'duration_pred': duration_pred.squeeze(-1),  # [batch, seq_len]
         }
     
     def _forward_with_teacher_forcing(
         self,
-        word_encoding: torch.Tensor,
+        sentence_encoding: torch.Tensor,
         mel_targets: torch.Tensor,
         target_frames: int
     ) -> torch.Tensor:
@@ -194,15 +171,15 @@ class StudentTTSModel(nn.Module):
         Autoregressive forward with teacher forcing (for training)
         
         Args:
-            word_encoding: [batch, hidden_dim]
+            sentence_encoding: [batch, hidden_dim] - full sentence encoding
             mel_targets: [batch, n_mels, frames] ground truth
             target_frames: number of frames
             
         Returns:
             mel_pred: [batch, n_mels, frames]
         """
-        batch_size = word_encoding.shape[0]
-        device = word_encoding.device
+        batch_size = sentence_encoding.shape[0]
+        device = sentence_encoding.device
         
         # Prepare decoder input: shift mel_targets right and prepend GO frame
         # mel_targets: [batch, n_mels, frames]
@@ -218,11 +195,11 @@ class StudentTTSModel(nn.Module):
         # Pass through prenet
         prenet_out = self.mel_prenet(decoder_input_mels)  # [batch, frames, prenet_dim]
         
-        # Expand word encoding to match frames
-        word_encoding_expanded = word_encoding.unsqueeze(1).repeat(1, target_frames, 1)
+        # Expand sentence encoding to match frames
+        encoding_expanded = sentence_encoding.unsqueeze(1).repeat(1, target_frames, 1)
         
         # Concatenate text encoding with prenet output
-        decoder_input = torch.cat([word_encoding_expanded, prenet_out], dim=2)
+        decoder_input = torch.cat([encoding_expanded, prenet_out], dim=2)
         
         # Decode
         frame_hidden, _ = self.frame_decoder(decoder_input)
@@ -235,21 +212,21 @@ class StudentTTSModel(nn.Module):
     
     def _forward_autoregressive(
         self,
-        word_encoding: torch.Tensor,
+        sentence_encoding: torch.Tensor,
         target_frames: int
     ) -> torch.Tensor:
         """
         Autoregressive generation (for inference)
         
         Args:
-            word_encoding: [batch, hidden_dim]
+            sentence_encoding: [batch, hidden_dim] - full sentence encoding
             target_frames: number of frames to generate
             
         Returns:
             mel_pred: [batch, n_mels, frames]
         """
-        batch_size = word_encoding.shape[0]
-        device = word_encoding.device
+        batch_size = sentence_encoding.shape[0]
+        device = sentence_encoding.device
         
         # Initialize with GO frame
         prev_mel = self.go_frame.expand(batch_size, -1)  # [batch, n_mels]
@@ -265,8 +242,8 @@ class StudentTTSModel(nn.Module):
             # Process previous mel through prenet
             prenet_out = self.mel_prenet(prev_mel)  # [batch, prenet_dim]
             
-            # Concatenate with text encoding
-            decoder_input = torch.cat([word_encoding, prenet_out], dim=1)  # [batch, hidden+prenet]
+            # Concatenate with sentence encoding
+            decoder_input = torch.cat([sentence_encoding, prenet_out], dim=1)  # [batch, hidden+prenet]
             decoder_input = decoder_input.unsqueeze(1)  # [batch, 1, hidden+prenet]
             
             # Decode one frame
@@ -366,36 +343,33 @@ if __name__ == "__main__":
     from config import *
     
     vocab_size = 100
-    batch_size = 4
-    seq_len = 3  # 1 current word + 2 lookahead
+    batch_size = 2
+    seq_len = 5  # Full sentence tokens (no lookahead)
     
     # Test StudentTTSModel
-    print("Testing StudentTTSModel...")
+    print("Testing StudentTTSModel (Autoregressive)...")
     model = StudentTTSModel(
         vocab_size=vocab_size,
         n_mels=N_MELS,
         hidden_dim=HIDDEN_DIM,
         num_layers=NUM_LAYERS,
         num_heads=NUM_HEADS,
-        max_frames=100
+        max_frames=100,
+        use_autoregression=True
     )
     
     text_tokens = torch.randint(0, vocab_size, (batch_size, seq_len))
-    output = model(text_tokens, target_frames=50)
+    mel_targets = torch.randn(batch_size, N_MELS, 50)
     
+    # Test with teacher forcing
+    output_train = model(text_tokens, target_frames=50, mel_targets=mel_targets)
     print(f"Input shape: {text_tokens.shape}")
-    print(f"Mel pred shape: {output['mel_pred'].shape}")
-    print(f"Duration pred shape: {output['duration_pred'].shape}")
+    print(f"Mel pred shape (training): {output_train['mel_pred'].shape}")
     
-    # Test SimpleCNNTTS
-    print("\nTesting SimpleCNNTTS...")
-    model_cnn = SimpleCNNTTS(vocab_size=vocab_size, n_mels=N_MELS, max_frames=100)
-    output_cnn = model_cnn(text_tokens, target_frames=50)
-    print(f"CNN Mel pred shape: {output_cnn['mel_pred'].shape}")
+    # Test without teacher forcing (inference)
+    output_inf = model(text_tokens, target_frames=50)
+    print(f"Mel pred shape (inference): {output_inf['mel_pred'].shape}")
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"\nTotal parameters (Transformer): {total_params:,}")
-    
-    total_params_cnn = sum(p.numel() for p in model_cnn.parameters())
-    print(f"Total parameters (CNN): {total_params_cnn:,}")
+    print(f"\nTotal parameters (Autoregressive): {total_params:,}")
