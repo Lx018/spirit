@@ -16,3 +16,8 @@ tts_queue/*
 chat_output_final.wav
 Qwen3-32B/*
 Qwen32B*
+STTS/outputs/*
+STTS/checkpoints/*
+STTS/data/*
+STTS/__pycache__/*
+index-tts
