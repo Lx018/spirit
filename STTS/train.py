@@ -120,6 +120,7 @@ class TTSTrainer:
         
         # Loss function
         self.criterion = nn.MSELoss()
+        self.stop_criterion = nn.BCEWithLogitsLoss()  # For stop token
         
         # Tracking
         self.best_loss = float('inf')
@@ -137,9 +138,10 @@ class TTSTrainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
         
         for batch_idx, batch in enumerate(pbar):
-            text_tokens = batch['text_tokens'].to(self.device)
-            mel_targets = batch['mel_targets'].to(self.device)
-            frame_lengths = batch['frame_lengths']
+            # Move data to GPU
+            text_tokens = batch['text_tokens'].to(self.device, non_blocking=True)
+            mel_targets = batch['mel_targets'].to(self.device, non_blocking=True)
+            frame_lengths = batch['frame_lengths'].to(self.device, non_blocking=True)
             
             # Forward pass
             self.optimizer.zero_grad()
@@ -152,16 +154,34 @@ class TTSTrainer:
                 mel_targets=mel_targets  # Pass ground truth for teacher forcing
             )
             mel_pred = output['mel_pred']
+            stop_tokens = output['stop_tokens']
             
-            # Calculate loss (only on valid frames)
-            loss = 0
+            # Create stop token targets (1.0 at end, 0.0 elsewhere)
+            batch_size = mel_targets.shape[0]
+            stop_targets = torch.zeros(batch_size, max_len, device=self.device)
+            for i in range(batch_size):
+                valid_len = frame_lengths[i]
+                if valid_len < max_len:
+                    stop_targets[i, valid_len:] = 1.0  # Stop after valid frames
+            
+            # Calculate mel loss (only on valid frames)
+            mel_loss = 0
             for i in range(len(frame_lengths)):
                 valid_len = frame_lengths[i]
-                loss += self.criterion(
+                mel_loss += self.criterion(
                     mel_pred[i, :, :valid_len],
                     mel_targets[i, :, :valid_len]
                 )
-            loss = loss / len(frame_lengths)
+            mel_loss = mel_loss / len(frame_lengths)
+            
+            # Calculate stop token loss
+            if stop_tokens is not None:
+                stop_loss = self.stop_criterion(stop_tokens, stop_targets)
+            else:
+                stop_loss = 0
+            
+            # Combined loss
+            loss = mel_loss + stop_loss
             
             # Backward pass
             loss.backward()
@@ -219,26 +239,21 @@ class TTSTrainer:
             # Learning rate scheduling (based on training loss)
             self.scheduler.step(train_loss)
             
-            # Save best model based on training loss
+            # Save best model (overwrite previous best)
             if train_loss < self.best_loss:
                 self.best_loss = train_loss
                 checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_model.pt")
                 self.save_checkpoint(epoch, checkpoint_path)
-                
-                # Generate audio from first sample
+                print(f"✓ New best model saved (loss: {train_loss:.4f})")
+            
+            # Generate sample audio every 10 epochs
+            if epoch % 10 == 0:
                 audio_path = os.path.join(OUTPUT_DIR, f"sample_epoch_{epoch}.wav")
                 print(f"Generating sample audio...")
                 self.generate_sample_audio(
                     self.first_sample['text_tokens'],
                     audio_path,
                     target_frames=self.first_sample['num_frames']
-                )
-            
-            # Save periodic checkpoint
-            if epoch % 10 == 0:
-                self.save_checkpoint(
-                    epoch,
-                    os.path.join(CHECKPOINT_DIR, f"checkpoint_epoch_{epoch}.pt")
                 )
         
         print("\nTraining completed!")
@@ -296,11 +311,11 @@ def main():
     """Main training function"""
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Train Student TTS Model")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+    parser.add_argument("-b", "--batch-size", type=int, default=BATCH_SIZE,
                        help=f"Batch size for training (default: {BATCH_SIZE})")
-    parser.add_argument("--learning-rate", "--lr", type=float, default=LEARNING_RATE,
+    parser.add_argument("-lr", "--learning-rate", type=float, default=LEARNING_RATE,
                        help=f"Learning rate (default: {LEARNING_RATE})")
-    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS,
+    parser.add_argument("-e", "--epochs", type=int, default=NUM_EPOCHS,
                        help=f"Number of epochs (default: {NUM_EPOCHS})")
     parser.add_argument("--device", type=str, default=DEVICE,
                        help=f"Device to use: cuda or cpu (default: {DEVICE})")
@@ -337,14 +352,23 @@ def main():
     train_dataset = dataset
     val_dataset = None
     
-    # Create dataloader
+    # Check device first
+    device = args.device if torch.cuda.is_available() else "cpu"
+    if device == "cpu" and args.device == "cuda":
+        print("WARNING: CUDA not available, using CPU")
+    print(f"Using device: {device}")
+    
+    # Create dataloader (no workers, simple GPU transfer in training loop)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0  # Set to 0 for debugging, increase for faster loading
+        num_workers=0,
+        pin_memory=True  # Pin memory for faster CPU-to-GPU transfer
     )
+    
+    print(f"DataLoader: pin_memory=True for faster GPU transfer")
     
     val_loader = None
     
@@ -357,19 +381,13 @@ def main():
         num_layers=NUM_LAYERS,
         num_heads=NUM_HEADS,
         dropout=DROPOUT,
-        max_frames=200,  # Adjust based on your data
+        max_frames=400,  # Adjust based on your data
         use_autoregression=True  # Enable autoregressive generation
     )
     
     print(f"Autoregressive mode: {model.use_autoregression}")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
-    
-    # Check device
-    device = args.device if torch.cuda.is_available() else "cpu"
-    if device == "cpu" and args.device == "cuda":
-        print("WARNING: CUDA not available, using CPU")
-    print(f"Using device: {device}")
     
     # Create trainer
     print("\n4. Initializing trainer...")

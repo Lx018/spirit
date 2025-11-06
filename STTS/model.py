@@ -25,6 +25,79 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1)]
 
 
+class LocationSensitiveAttention(nn.Module):
+    """
+    Location-sensitive attention mechanism (Tacotron 2 style)
+    Helps model track where it is in the text sequence
+    """
+    
+    def __init__(self, query_dim: int, key_dim: int, attention_dim: int, location_filters: int = 32):
+        super().__init__()
+        
+        self.query_layer = nn.Linear(query_dim, attention_dim, bias=False)
+        self.key_layer = nn.Linear(key_dim, attention_dim, bias=False)
+        self.value = nn.Linear(attention_dim, 1, bias=False)
+        
+        # Location-aware features
+        self.location_conv = nn.Conv1d(
+            1, location_filters,
+            kernel_size=31, padding=15,
+            bias=False
+        )
+        self.location_layer = nn.Linear(location_filters, attention_dim, bias=False)
+        
+    def forward(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        attention_weights_cat: torch.Tensor = None
+    ) -> tuple:
+        """
+        Args:
+            query: [batch, query_dim] - current decoder state
+            keys: [batch, seq_len, key_dim] - encoder outputs
+            attention_weights_cat: [batch, seq_len] - previous attention weights
+            
+        Returns:
+            context: [batch, key_dim] - attended context vector
+            attention_weights: [batch, seq_len] - current attention weights
+        """
+        # Process query
+        query_processed = self.query_layer(query.unsqueeze(1))  # [batch, 1, attention_dim]
+        
+        # Process keys
+        keys_processed = self.key_layer(keys)  # [batch, seq_len, attention_dim]
+        
+        # Process location features
+        if attention_weights_cat is not None:
+            # attention_weights_cat: [batch, seq_len]
+            attention_weights_cat = attention_weights_cat.unsqueeze(1)  # [batch, 1, seq_len]
+            location_features = self.location_conv(attention_weights_cat)  # [batch, filters, seq_len]
+            location_features = location_features.transpose(1, 2)  # [batch, seq_len, filters]
+            location_processed = self.location_layer(location_features)  # [batch, seq_len, attention_dim]
+        else:
+            # Initialize with zeros
+            batch_size, seq_len, _ = keys.shape
+            location_processed = torch.zeros(
+                batch_size, seq_len, query_processed.shape[2],
+                device=query.device, dtype=query.dtype
+            )
+        
+        # Compute attention scores
+        alignment = query_processed + keys_processed + location_processed  # [batch, seq_len, attention_dim]
+        alignment = torch.tanh(alignment)
+        alignment = self.value(alignment).squeeze(2)  # [batch, seq_len]
+        
+        # Compute attention weights
+        attention_weights = F.softmax(alignment, dim=1)  # [batch, seq_len]
+        
+        # Compute context vector
+        context = torch.bmm(attention_weights.unsqueeze(1), keys)  # [batch, 1, key_dim]
+        context = context.squeeze(1)  # [batch, key_dim]
+        
+        return context, attention_weights
+
+
 class StudentTTSModel(nn.Module):
     """
     Autoregressive TTS Student Model
@@ -67,6 +140,14 @@ class StudentTTSModel(nn.Module):
         )
         self.text_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         
+        # Attention mechanism (NEW!)
+        self.attention = LocationSensitiveAttention(
+            query_dim=hidden_dim,  # From LSTM decoder
+            key_dim=hidden_dim,    # From text encoder
+            attention_dim=128,
+            location_filters=32
+        )
+        
         # Mel prenet - processes previous mel frames (autoregressive component)
         if use_autoregression:
             self.mel_prenet = nn.Sequential(
@@ -81,7 +162,8 @@ class StudentTTSModel(nn.Module):
             self.mel_prenet = None
             prenet_dim = 0
         
-        # Autoregressive frame decoder (LSTM that takes text encoding + previous mel)
+        # Autoregressive frame decoder (LSTM that takes context + previous mel)
+        # Now takes attention context instead of mean pooling!
         lstm_input_dim = hidden_dim + prenet_dim if use_autoregression else hidden_dim
         self.frame_decoder = nn.LSTM(
             lstm_input_dim, 
@@ -91,6 +173,9 @@ class StudentTTSModel(nn.Module):
             dropout=dropout
         )
         self.frame_to_mel = nn.Linear(hidden_dim, n_mels)
+        
+        # Stop token prediction (NEW!)
+        self.stop_token = nn.Linear(hidden_dim, 1)
         
         # Learnable initial mel frame (GO frame)
         if use_autoregression:
@@ -130,8 +215,8 @@ class StudentTTSModel(nn.Module):
         # Encode full sentence
         text_encoded = self.text_encoder(text_emb)  # [batch, seq_len, hidden]
         
-        # Use mean pooling to get sentence-level encoding
-        sentence_encoding = text_encoded.mean(dim=1)  # [batch, hidden]
+        # Keep text_encoded for attention (NO MORE MEAN POOLING!)
+        # text_encoded will be used as keys/values in attention
         
         # Determine target frames (default: estimate based on text length)
         if target_frames is None:
@@ -139,126 +224,192 @@ class StudentTTSModel(nn.Module):
             target_frames = min(seq_len, self.max_frames)
         
         if self.use_autoregression:
-            # Autoregressive generation
+            # Autoregressive generation with attention
             if mel_targets is not None:
                 # Training mode: use teacher forcing
-                mel_pred = self._forward_with_teacher_forcing(
-                    sentence_encoding, mel_targets, target_frames
+                mel_pred, stop_tokens, attention_weights = self._forward_with_teacher_forcing(
+                    text_encoded, mel_targets, target_frames
                 )
             else:
                 # Inference mode: autoregressive generation
-                mel_pred = self._forward_autoregressive(
-                    sentence_encoding, target_frames
+                mel_pred, stop_tokens, attention_weights = self._forward_autoregressive(
+                    text_encoded, target_frames
                 )
         else:
-            # Non-autoregressive (original) generation
+            # Non-autoregressive (original) generation - fallback to mean pooling
+            sentence_encoding = text_encoded.mean(dim=1)
             encoding_expanded = sentence_encoding.unsqueeze(1).repeat(1, target_frames, 1)
             frame_hidden, _ = self.frame_decoder(encoding_expanded)
             mel_pred = self.frame_to_mel(frame_hidden)  # [batch, frames, n_mels]
             mel_pred = mel_pred.transpose(1, 2)  # [batch, n_mels, frames]
+            stop_tokens = None
+            attention_weights = None
         
         return {
             'mel_pred': mel_pred,
+            'stop_tokens': stop_tokens,
+            'attention_weights': attention_weights
         }
     
     def _forward_with_teacher_forcing(
         self,
-        sentence_encoding: torch.Tensor,
+        text_encoded: torch.Tensor,
         mel_targets: torch.Tensor,
         target_frames: int
-    ) -> torch.Tensor:
+    ) -> tuple:
         """
-        Autoregressive forward with teacher forcing (for training)
+        Autoregressive forward with teacher forcing and attention
         
         Args:
-            sentence_encoding: [batch, hidden_dim] - full sentence encoding
+            text_encoded: [batch, seq_len, hidden_dim] - encoder outputs
             mel_targets: [batch, n_mels, frames] ground truth
             target_frames: number of frames
             
         Returns:
             mel_pred: [batch, n_mels, frames]
+            stop_tokens: [batch, frames] - stop token predictions
+            attention_weights: [batch, frames, seq_len] - attention alignments
         """
-        batch_size = sentence_encoding.shape[0]
-        device = sentence_encoding.device
+        batch_size = text_encoded.shape[0]
+        device = text_encoded.device
         
-        # Prepare decoder input: shift mel_targets right and prepend GO frame
-        # mel_targets: [batch, n_mels, frames]
-        go_frame = self.go_frame.expand(batch_size, -1).unsqueeze(2)  # [batch, n_mels, 1]
+        # Storage for outputs
+        mel_outputs = []
+        stop_outputs = []
+        attention_weights_list = []
         
-        # Take all but last frame from targets
-        shifted_mels = mel_targets[:, :, :target_frames-1]  # [batch, n_mels, frames-1]
-        decoder_input_mels = torch.cat([go_frame, shifted_mels], dim=2)  # [batch, n_mels, frames]
+        # Initialize
+        prev_mel = self.go_frame.expand(batch_size, -1)  # [batch, n_mels]
+        attention_context = torch.zeros(batch_size, self.hidden_dim, device=device)
+        attention_weights_cat = None
+        h = None  # LSTM hidden state
         
-        # Transpose for prenet: [batch, frames, n_mels]
-        decoder_input_mels = decoder_input_mels.transpose(1, 2)
+        # Generate frame by frame with teacher forcing
+        for t in range(target_frames):
+            # Process previous mel through prenet
+            prenet_out = self.mel_prenet(prev_mel)  # [batch, prenet_dim]
+            
+            # Concatenate attention context with prenet output
+            decoder_input = torch.cat([attention_context, prenet_out], dim=1)  # [batch, hidden+prenet]
+            decoder_input = decoder_input.unsqueeze(1)  # [batch, 1, hidden+prenet]
+            
+            # LSTM decoder
+            decoder_output, h = self.frame_decoder(decoder_input, h)
+            decoder_output = decoder_output.squeeze(1)  # [batch, hidden]
+            
+            # Attention: query with decoder output
+            attention_context, attention_weights = self.attention(
+                query=decoder_output,
+                keys=text_encoded,
+                attention_weights_cat=attention_weights_cat
+            )
+            
+            # Predict mel frame
+            mel_frame = self.frame_to_mel(decoder_output)  # [batch, n_mels]
+            
+            # Predict stop token
+            stop_token = self.stop_token(decoder_output)  # [batch, 1]
+            
+            # Store outputs
+            mel_outputs.append(mel_frame)
+            stop_outputs.append(stop_token.squeeze(1))
+            attention_weights_list.append(attention_weights)
+            
+            # Teacher forcing: use ground truth as next input
+            if t < target_frames - 1:
+                prev_mel = mel_targets[:, :, t]  # [batch, n_mels]
+            
+            # Update attention weights (for location-sensitive attention)
+            attention_weights_cat = attention_weights
         
-        # Pass through prenet
-        prenet_out = self.mel_prenet(decoder_input_mels)  # [batch, frames, prenet_dim]
+        # Stack outputs
+        mel_pred = torch.stack(mel_outputs, dim=2)  # [batch, n_mels, frames]
+        stop_tokens = torch.stack(stop_outputs, dim=1)  # [batch, frames]
+        attention_weights = torch.stack(attention_weights_list, dim=1)  # [batch, frames, seq_len]
         
-        # Expand sentence encoding to match frames
-        encoding_expanded = sentence_encoding.unsqueeze(1).repeat(1, target_frames, 1)
-        
-        # Concatenate text encoding with prenet output
-        decoder_input = torch.cat([encoding_expanded, prenet_out], dim=2)
-        
-        # Decode
-        frame_hidden, _ = self.frame_decoder(decoder_input)
-        mel_pred = self.frame_to_mel(frame_hidden)  # [batch, frames, n_mels]
-        
-        # Transpose back to [batch, n_mels, frames]
-        mel_pred = mel_pred.transpose(1, 2)
-        
-        return mel_pred
+        return mel_pred, stop_tokens, attention_weights
     
     def _forward_autoregressive(
         self,
-        sentence_encoding: torch.Tensor,
-        target_frames: int
-    ) -> torch.Tensor:
+        text_encoded: torch.Tensor,
+        target_frames: int,
+        stop_threshold: float = 0.5
+    ) -> tuple:
         """
-        Autoregressive generation (for inference)
+        Autoregressive generation with attention (for inference)
         
         Args:
-            sentence_encoding: [batch, hidden_dim] - full sentence encoding
-            target_frames: number of frames to generate
+            text_encoded: [batch, seq_len, hidden_dim] - encoder outputs
+            target_frames: maximum number of frames to generate
+            stop_threshold: threshold for stop token (0.5 = 50% confidence)
             
         Returns:
             mel_pred: [batch, n_mels, frames]
+            stop_tokens: [batch, frames]
+            attention_weights: [batch, frames, seq_len]
         """
-        batch_size = sentence_encoding.shape[0]
-        device = sentence_encoding.device
+        batch_size = text_encoded.shape[0]
+        device = text_encoded.device
         
-        # Initialize with GO frame
-        prev_mel = self.go_frame.expand(batch_size, -1)  # [batch, n_mels]
-        
-        # Storage for generated frames
+        # Storage for outputs
         mel_outputs = []
+        stop_outputs = []
+        attention_weights_list = []
         
-        # Initialize LSTM hidden state
-        h = None
+        # Initialize
+        prev_mel = self.go_frame.expand(batch_size, -1)  # [batch, n_mels]
+        attention_context = torch.zeros(batch_size, self.hidden_dim, device=device)
+        attention_weights_cat = None
+        h = None  # LSTM hidden state
         
         # Generate frame by frame
         for t in range(target_frames):
             # Process previous mel through prenet
             prenet_out = self.mel_prenet(prev_mel)  # [batch, prenet_dim]
             
-            # Concatenate with sentence encoding
-            decoder_input = torch.cat([sentence_encoding, prenet_out], dim=1)  # [batch, hidden+prenet]
+            # Concatenate attention context with prenet output
+            decoder_input = torch.cat([attention_context, prenet_out], dim=1)  # [batch, hidden+prenet]
             decoder_input = decoder_input.unsqueeze(1)  # [batch, 1, hidden+prenet]
             
-            # Decode one frame
-            frame_hidden, h = self.frame_decoder(decoder_input, h)
-            mel_frame = self.frame_to_mel(frame_hidden.squeeze(1))  # [batch, n_mels]
+            # LSTM decoder
+            decoder_output, h = self.frame_decoder(decoder_input, h)
+            decoder_output = decoder_output.squeeze(1)  # [batch, hidden]
             
+            # Attention: query with decoder output
+            attention_context, attention_weights = self.attention(
+                query=decoder_output,
+                keys=text_encoded,
+                attention_weights_cat=attention_weights_cat
+            )
+            
+            # Predict mel frame
+            mel_frame = self.frame_to_mel(decoder_output)  # [batch, n_mels]
+            
+            # Predict stop token
+            stop_token = self.stop_token(decoder_output)  # [batch, 1]
+            stop_prob = torch.sigmoid(stop_token)
+            
+            # Store outputs
             mel_outputs.append(mel_frame)
+            stop_outputs.append(stop_token.squeeze(1))
+            attention_weights_list.append(attention_weights)
             
             # Use predicted frame as next input
             prev_mel = mel_frame
+            
+            # Update attention weights (for location-sensitive attention)
+            attention_weights_cat = attention_weights
+            
+            # Early stopping if model is confident it should stop
+            if t > 10 and (stop_prob > stop_threshold).all():  # Allow at least 10 frames
+                break
         
-        # Stack all frames: [batch, n_mels, frames]
-        mel_pred = torch.stack(mel_outputs, dim=2)
+        # Stack outputs
+        mel_pred = torch.stack(mel_outputs, dim=2)  # [batch, n_mels, frames]
+        stop_tokens = torch.stack(stop_outputs, dim=1)  # [batch, frames]
+        attention_weights = torch.stack(attention_weights_list, dim=1)  # [batch, frames, seq_len]
         
-        return mel_pred
+        return mel_pred, stop_tokens, attention_weights
 
 
 class SimpleCNNTTS(nn.Module):
