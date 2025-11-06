@@ -1,5 +1,6 @@
 """
-Training script for Student TTS Model
+Training script for Timing-based TTS Model
+Uses explicit word timing labels instead of attention mechanism
 """
 import torch
 import torch.nn as nn
@@ -8,37 +9,26 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import json
 from tqdm import tqdm
-import numpy as np
-from typing import List, Dict
 import os
 import torchaudio
 import argparse
 
 from config import *
-from data_processor import TTSDataProcessor
-from model import StudentTTSModel, SimpleCNNTTS
+from data_processor_t import TimingDataProcessor
+from model_t import TimingBasedTTS
 
 
-
-class TTSDataset(Dataset):
-    """Dataset for TTS training"""
+class TimingTTSDataset(Dataset):
+    """Dataset for timing-based TTS training"""
     
-    def __init__(self, data_dir: str, processor: TTSDataProcessor):
+    def __init__(self, data_dir: str, processor: TimingDataProcessor):
         self.data_dir = Path(data_dir)
         self.processor = processor
-        self.samples = []
         
-        # Load all data pairs
-        txt_files = sorted(self.data_dir.glob("*.txt"))
+        # Process all audio+JSON pairs
+        self.samples = processor.process_directory(data_dir)
         
-        for txt_file in txt_files:
-            wav_file = txt_file.with_suffix(".wav")
-            if wav_file.exists():
-                # Process file pair into chunks
-                chunks = processor.process_file_pair(str(txt_file), str(wav_file))
-                self.samples.extend(chunks)
-        
-        print(f"Loaded {len(self.samples)} training samples from {len(txt_files)} file pairs")
+        print(f"Loaded {len(self.samples)} training samples")
     
     def __len__(self):
         return len(self.samples)
@@ -47,6 +37,7 @@ class TTSDataset(Dataset):
         sample = self.samples[idx]
         return {
             'text_tokens': sample['text_tokens'],
+            'word_indices': sample['word_indices'],
             'mel_target': sample['mel_target'],
             'num_frames': sample['num_frames']
         }
@@ -54,20 +45,26 @@ class TTSDataset(Dataset):
 
 def collate_fn(batch):
     """Custom collate function to handle variable-length sequences"""
-    # Find max sequence length and max frames in batch
+    # Find max lengths
     max_seq_len = max(item['text_tokens'].shape[0] for item in batch)
     max_frames = max(item['num_frames'] for item in batch)
     
     batch_size = len(batch)
     n_mels = batch[0]['mel_target'].shape[0]
     
-    # Pad text tokens to same length
+    # Pad text tokens
     text_tokens = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
     for i, item in enumerate(batch):
         seq_len = item['text_tokens'].shape[0]
         text_tokens[i, :seq_len] = item['text_tokens']
     
-    # Pad mel specs to same length
+    # Pad word indices
+    word_indices = torch.zeros(batch_size, max_frames, dtype=torch.long)
+    for i, item in enumerate(batch):
+        num_frames = item['num_frames']
+        word_indices[i, :num_frames] = item['word_indices']
+    
+    # Pad mel specs
     mel_targets = torch.zeros(batch_size, n_mels, max_frames)
     frame_lengths = torch.zeros(batch_size, dtype=torch.long)
     
@@ -79,27 +76,28 @@ def collate_fn(batch):
     
     return {
         'text_tokens': text_tokens,
+        'word_indices': word_indices,
         'mel_targets': mel_targets,
         'frame_lengths': frame_lengths
     }
 
 
-class TTSTrainer:
-    """Trainer for Student TTS Model"""
+class TimingTTSTrainer:
+    """Trainer for Timing-based TTS Model"""
     
     def __init__(
         self,
         model: nn.Module,
         train_loader: DataLoader,
-        dataset: torch.utils.data.Dataset,
-        processor: TTSDataProcessor,
+        dataset: Dataset,
+        processor: TimingDataProcessor,
         learning_rate: float = 1e-4,
         device: str = "cuda"
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
-        self.dataset = dataset  # Store full dataset for generating samples
-        self.processor = processor  # Store processor for vocab access
+        self.dataset = dataset
+        self.processor = processor
         self.device = device
         
         # Optimizer
@@ -110,7 +108,7 @@ class TTSTrainer:
             eps=1e-9
         )
         
-        # Learning rate scheduler (based on training loss now)
+        # Learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='min',
@@ -118,9 +116,9 @@ class TTSTrainer:
             patience=10
         )
         
-        # Loss function
+        # Loss functions
         self.criterion = nn.MSELoss()
-        self.stop_criterion = nn.BCEWithLogitsLoss()  # For stop token
+        self.stop_criterion = nn.BCEWithLogitsLoss()
         
         # Tracking
         self.best_loss = float('inf')
@@ -140,29 +138,29 @@ class TTSTrainer:
         for batch_idx, batch in enumerate(pbar):
             # Move data to GPU
             text_tokens = batch['text_tokens'].to(self.device, non_blocking=True)
+            word_indices = batch['word_indices'].to(self.device, non_blocking=True)
             mel_targets = batch['mel_targets'].to(self.device, non_blocking=True)
             frame_lengths = batch['frame_lengths'].to(self.device, non_blocking=True)
             
             # Forward pass
             self.optimizer.zero_grad()
             
-            # Get predictions (with teacher forcing for autoregressive model)
-            max_len = mel_targets.shape[2]
             output = self.model(
-                text_tokens, 
-                target_frames=max_len,
-                mel_targets=mel_targets  # Pass ground truth for teacher forcing
+                text_tokens,
+                word_indices=word_indices,
+                mel_targets=mel_targets
             )
+            
             mel_pred = output['mel_pred']
             stop_tokens = output['stop_tokens']
             
-            # Create stop token targets (1.0 at end, 0.0 elsewhere)
-            batch_size = mel_targets.shape[0]
+            # Create stop token targets
+            batch_size, _, max_len = mel_targets.shape
             stop_targets = torch.zeros(batch_size, max_len, device=self.device)
             for i in range(batch_size):
                 valid_len = frame_lengths[i]
                 if valid_len < max_len:
-                    stop_targets[i, valid_len:] = 1.0  # Stop after valid frames
+                    stop_targets[i, valid_len:] = 1.0
             
             # Calculate mel loss (only on valid frames)
             mel_loss = 0
@@ -175,10 +173,7 @@ class TTSTrainer:
             mel_loss = mel_loss / len(frame_lengths)
             
             # Calculate stop token loss
-            if stop_tokens is not None:
-                stop_loss = self.stop_criterion(stop_tokens, stop_targets)
-            else:
-                stop_loss = 0
+            stop_loss = self.stop_criterion(stop_tokens, stop_targets)
             
             # Combined loss
             loss = mel_loss + stop_loss
@@ -194,7 +189,11 @@ class TTSTrainer:
             total_loss += loss.item()
             
             # Update progress bar
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'mel': f'{mel_loss.item():.4f}',
+                'stop': f'{stop_loss.item():.4f}'
+            })
         
         avg_loss = total_loss / len(self.train_loader)
         self.train_losses.append(avg_loss)
@@ -236,19 +235,19 @@ class TTSTrainer:
             train_loss = self.train_epoch(epoch)
             print(f"Epoch {epoch}/{start_epoch + num_epochs - 1} - Train Loss: {train_loss:.4f}")
             
-            # Learning rate scheduling (based on training loss)
+            # Learning rate scheduling
             self.scheduler.step(train_loss)
             
-            # Save best model (overwrite previous best)
+            # Save best model
             if train_loss < self.best_loss:
                 self.best_loss = train_loss
-                checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+                checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_model_timing.pt")
                 self.save_checkpoint(epoch, checkpoint_path)
                 print(f"✓ New best model saved (loss: {train_loss:.4f})")
             
             # Generate sample audio every 10 epochs
             if epoch % 10 == 0:
-                audio_path = os.path.join(OUTPUT_DIR, f"sample_epoch_{epoch}.wav")
+                audio_path = os.path.join(OUTPUT_DIR, f"sample_timing_epoch_{epoch}.wav")
                 print(f"Generating sample audio...")
                 self.generate_sample_audio(
                     self.first_sample['text_tokens'],
@@ -264,7 +263,7 @@ class TTSTrainer:
             'train_losses': self.train_losses,
             'best_loss': self.best_loss
         }
-        with open(os.path.join(LOG_DIR, "training_history.json"), 'w') as f:
+        with open(os.path.join(LOG_DIR, "training_history_timing.json"), 'w') as f:
             json.dump(history, f, indent=2)
     
     def generate_sample_audio(self, text_tokens: torch.Tensor, output_path: str, target_frames: int = 86):
@@ -272,12 +271,12 @@ class TTSTrainer:
         self.model.eval()
         
         with torch.no_grad():
-            text_tokens = text_tokens.unsqueeze(0).to(self.device)  # [1, seq_len]
+            text_tokens = text_tokens.unsqueeze(0).to(self.device)
             output = self.model(text_tokens, target_frames=target_frames)
-            mel_pred = output['mel_pred'].squeeze(0)  # [n_mels, frames]
+            mel_pred = output['mel_pred'].squeeze(0)
         
         # Convert mel to audio using Griffin-Lim
-        mel = torch.exp(mel_pred)  # Convert from log scale
+        mel = torch.exp(mel_pred)
         
         # Griffin-Lim vocoder
         vocoder = torchaudio.transforms.GriffinLim(
@@ -309,8 +308,7 @@ class TTSTrainer:
 
 def main():
     """Main training function"""
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Train Student TTS Model")
+    parser = argparse.ArgumentParser(description="Train Timing-based TTS Model")
     parser.add_argument("-b", "--batch-size", type=int, default=BATCH_SIZE,
                        help=f"Batch size for training (default: {BATCH_SIZE})")
     parser.add_argument("-lr", "--learning-rate", type=float, default=LEARNING_RATE,
@@ -325,7 +323,7 @@ def main():
     args = parser.parse_args()
     
     print("=" * 60)
-    print("Student TTS Model Training")
+    print("Timing-based TTS Model Training")
     print("=" * 60)
     print(f"Configuration:")
     print(f"  Batch size: {args.batch_size}")
@@ -336,64 +334,55 @@ def main():
     
     # Initialize data processor
     print("\n1. Initializing data processor...")
-    processor = TTSDataProcessor()
-    processor.save_vocab(os.path.join(OUTPUT_DIR, "vocab.json"))
+    processor = TimingDataProcessor()
     
     # Create dataset
     print("\n2. Creating dataset...")
-    dataset = TTSDataset(DATA_DIR, processor)
+    dataset = TimingTTSDataset(DATA_DIR, processor)
     
     if len(dataset) == 0:
         print("ERROR: No training data found!")
-        print(f"Please ensure .txt and .wav files exist in {DATA_DIR}")
+        print(f"Please ensure .wav and .json files exist in {DATA_DIR}")
+        print("Run speech_timing_tagger.py first to generate timing data!")
         return
     
-    print(f"Total samples: {len(dataset)} (using all for training)")
+    # Save vocabulary
+    processor.save_vocab(os.path.join(OUTPUT_DIR, "vocab_timing.json"))
     
-    # Use all data for training (no validation split)
-    train_dataset = dataset
-    val_dataset = None
-    
-    # Check device first
+    # Check device
     device = args.device if torch.cuda.is_available() else "cpu"
     if device == "cpu" and args.device == "cuda":
         print("WARNING: CUDA not available, using CPU")
     print(f"Using device: {device}")
     
-    # Create dataloader (no workers, simple GPU transfer in training loop)
+    # Create dataloader
     train_loader = DataLoader(
-        train_dataset,
+        dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=0,
-        pin_memory=True  # Pin memory for faster CPU-to-GPU transfer
+        pin_memory=True
     )
     
     print(f"DataLoader: pin_memory=True for faster GPU transfer")
     
-    val_loader = None
-    
     # Create model
     print("\n3. Creating model...")
-    model = StudentTTSModel(
-        vocab_size=len(processor.vocab),
+    model = TimingBasedTTS(
+        vocab_size=processor.vocab_size,
         n_mels=N_MELS,
         hidden_dim=HIDDEN_DIM,
-        num_layers=NUM_LAYERS,
-        num_heads=NUM_HEADS,
-        dropout=DROPOUT,
-        max_frames=400,  # Adjust based on your data
-        use_autoregression=True  # Enable autoregressive generation
+        lstm_layers=NUM_LAYERS,
+        dropout=DROPOUT
     )
     
-    print(f"Autoregressive mode: {model.use_autoregression}")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
     
     # Create trainer
     print("\n4. Initializing trainer...")
-    trainer = TTSTrainer(
+    trainer = TimingTTSTrainer(
         model=model,
         train_loader=train_loader,
         dataset=dataset,
@@ -405,7 +394,7 @@ def main():
     # Load checkpoint if continuing training
     start_epoch = 1
     if args.continue_training:
-        checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_model_timing.pt")
         if os.path.exists(checkpoint_path):
             print(f"\n📥 Loading checkpoint from {checkpoint_path}...")
             start_epoch = trainer.load_checkpoint(checkpoint_path) + 1
@@ -419,28 +408,26 @@ def main():
     print("\n5. Starting training...")
     trainer.train(args.epochs, start_epoch=start_epoch)
     
-    # Generate final sample outputs after training
+    # Generate final sample outputs
     print("\n6. Generating final sample outputs...")
-    os.makedirs(os.path.join(OUTPUT_DIR, "samples"), exist_ok=True)
+    os.makedirs(os.path.join(OUTPUT_DIR, "samples_timing"), exist_ok=True)
     
-    # Generate audio for first few training samples
     num_samples = min(5, len(dataset))
     for i in range(num_samples):
         sample = dataset[i]
-        output_path = os.path.join(OUTPUT_DIR, "samples", f"final_sample_{i+1}.wav")
+        output_path = os.path.join(OUTPUT_DIR, "samples_timing", f"final_sample_{i+1}.wav")
         trainer.generate_sample_audio(
             sample['text_tokens'],
             output_path,
             target_frames=sample['num_frames']
         )
     
-    print(f"\nGenerated {num_samples} sample audio files in {os.path.join(OUTPUT_DIR, 'samples')}")
+    print(f"\nGenerated {num_samples} sample audio files in {os.path.join(OUTPUT_DIR, 'samples_timing')}")
     
     print("\nDone! Check outputs in:")
-    print(f"  - Checkpoints: {CHECKPOINT_DIR}")
-    print(f"  - Logs: {LOG_DIR}")
-    print(f"  - Outputs: {OUTPUT_DIR}")
-    print(f"  - Sample Audio: {os.path.join(OUTPUT_DIR, 'samples')}")
+    print(f"  - Checkpoints: {CHECKPOINT_DIR}/best_model_timing.pt")
+    print(f"  - Logs: {LOG_DIR}/training_history_timing.json")
+    print(f"  - Sample Audio: {os.path.join(OUTPUT_DIR, 'samples_timing')}")
 
 
 if __name__ == "__main__":
