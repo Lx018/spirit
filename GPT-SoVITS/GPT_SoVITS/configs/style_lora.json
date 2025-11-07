@@ -1,0 +1,35 @@
+{
+  "data": {
+    "list_file": "output/asr_opt/out.list",
+    "style_file": "output/asr_opt/style_labels.txt",
+    "sampling_rate": 32000,
+    "filter_length": 2048,
+    "hop_length": 640,
+    "win_length": 2048,
+    "n_mel_channels": 128,
+    "mel_fmin": 0.0,
+    "mel_fmax": null,
+    "n_speakers": 300
+  },
+  "model": {
+    "base_model_path": "SoVITS_weights_v2Pro/test_e8_s280.pth",
+    "version": "v2Pro",
+    "gin_channels": 512
+  },
+  "train": {
+    "num_styles": 5,
+    "lora_rank": 32,
+    "lora_alpha": 32,
+    "lora_dropout": 0.1,
+    "batch_size": 1,
+    "learning_rate": 0.0001,
+    "betas": [0.8, 0.99],
+    "eps": 1e-09,
+    "lr_decay": 0.999875,
+    "segment_size": 5120,
+    "fp16_run": true,
+    "epochs": 100,
+    "save_interval": 500,
+    "checkpoint_dir": "checkpoints_lora"
+  }
+}
