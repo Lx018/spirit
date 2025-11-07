@@ -491,11 +491,14 @@ def train(config_path):
             if global_step % config['train']['save_interval'] == 0:
                 ckpt_path = os.path.join(config['train']['checkpoint_dir'], f"lora_step_{global_step}.pt")
                 torch.save({
-                    'model': lora_controller.state_dict(),
+                    'lora_state_dict': lora_controller.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'epoch': epoch,
                     'global_step': global_step,
+                    'num_styles': config['train']['num_styles'],
+                    'lora_rank': config['train']['lora_rank'],
+                    'lora_alpha': config['train']['lora_alpha'],
                     'config': config
                 }, ckpt_path)
                 logger.info(f"Saved checkpoint: {ckpt_path}")

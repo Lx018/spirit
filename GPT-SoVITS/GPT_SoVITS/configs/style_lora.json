@@ -28,7 +28,7 @@
     "lr_decay": 0.999875,
     "segment_size": 5120,
     "fp16_run": true,
-    "epochs": 100,
+    "epochs": 1,
     "save_interval": 500,
     "checkpoint_dir": "checkpoints_lora"
   }

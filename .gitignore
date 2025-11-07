@@ -26,3 +26,6 @@ STTS/datawav/*
 STTS/out/*
 GPT-SoVITS/output.wav
 STTS/logs/training_history_timing.json
+GPT-SoVITS/output_*.wav
+
+GPT-SoVITS/checkpoints_lora/*
