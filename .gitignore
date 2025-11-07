@@ -21,3 +21,4 @@ STTS/checkpoints/*
 STTS/data/*
 STTS/__pycache__/*
 index-tts
+STTS/logs/training_log_timing.txt

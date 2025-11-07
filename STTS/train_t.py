@@ -124,9 +124,25 @@ class TimingTTSTrainer:
         self.best_loss = float('inf')
         self.train_losses = []
         
+        # Setup logging to file
+        log_file = os.path.join(LOG_DIR, "training_log_timing.txt")
+        self.log_file = open(log_file, 'a')
+        self.log_file.write("\n" + "="*80 + "\n")
+        self.log_file.write(f"Training started at {self._get_timestamp()}\n")
+        self.log_file.write(f"Learning rate: {learning_rate}\n")
+        self.log_file.write(f"Device: {device}\n")
+        self.log_file.write("="*80 + "\n")
+        self.log_file.flush()
+        print(f"Logging to: {log_file}")
+        
         # Get first sample for audio generation
         self.first_sample = dataset[0]
         print(f"First sample for audio generation: {self.first_sample['text_tokens'].shape}")
+    
+    def _get_timestamp(self):
+        """Get current timestamp"""
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     def train_epoch(self, epoch: int):
         """Train for one epoch"""
@@ -152,6 +168,7 @@ class TimingTTSTrainer:
             )
             
             mel_pred = output['mel_pred']
+            mel_postnet = output.get('mel_postnet')
             stop_tokens = output['stop_tokens']
             
             # Create stop token targets
@@ -163,14 +180,38 @@ class TimingTTSTrainer:
                     stop_targets[i, valid_len:] = 1.0
             
             # Calculate mel loss (only on valid frames)
-            mel_loss = 0
-            for i in range(len(frame_lengths)):
-                valid_len = frame_lengths[i]
-                mel_loss += self.criterion(
-                    mel_pred[i, :, :valid_len],
-                    mel_targets[i, :, :valid_len]
-                )
-            mel_loss = mel_loss / len(frame_lengths)
+            # When postnet is enabled, use postnet output as main target
+            if mel_postnet is not None:
+                # Postnet enabled: calculate both losses
+                mel_loss_pre = 0
+                mel_loss_post = 0
+                for i in range(len(frame_lengths)):
+                    valid_len = frame_lengths[i]
+                    mel_loss_pre += self.criterion(
+                        mel_pred[i, :, :valid_len],
+                        mel_targets[i, :, :valid_len]
+                    )
+                    mel_loss_post += self.criterion(
+                        mel_postnet[i, :, :valid_len],
+                        mel_targets[i, :, :valid_len]
+                    )
+                mel_loss_pre = mel_loss_pre / len(frame_lengths)
+                mel_loss_post = mel_loss_post / len(frame_lengths)
+                
+                # Combined: train both, but weight postnet more
+                mel_loss = mel_loss_pre + mel_loss_post
+                primary_loss = mel_loss_post  # Use for tracking/LR scheduling
+            else:
+                # Postnet disabled: only pre-postnet loss
+                mel_loss = 0
+                for i in range(len(frame_lengths)):
+                    valid_len = frame_lengths[i]
+                    mel_loss += self.criterion(
+                        mel_pred[i, :, :valid_len],
+                        mel_targets[i, :, :valid_len]
+                    )
+                mel_loss = mel_loss / len(frame_lengths)
+                primary_loss = mel_loss  # Use for tracking/LR scheduling
             
             # Calculate stop token loss
             stop_loss = self.stop_criterion(stop_tokens, stop_targets)
@@ -186,17 +227,32 @@ class TimingTTSTrainer:
             
             self.optimizer.step()
             
-            total_loss += loss.item()
+            # Track primary loss (postnet if enabled, else regular)
+            total_loss += primary_loss.item()
             
             # Update progress bar
-            pbar.set_postfix({
+            postfix = {
                 'loss': f'{loss.item():.4f}',
-                'mel': f'{mel_loss.item():.4f}',
+                'primary': f'{primary_loss.item():.4f}',
                 'stop': f'{stop_loss.item():.4f}'
-            })
+            }
+            if mel_postnet is not None:
+                postfix['postnet'] = 'ON'
+            pbar.set_postfix(postfix)
         
         avg_loss = total_loss / len(self.train_loader)
         self.train_losses.append(avg_loss)
+        
+        # Log epoch summary
+        current_lr = self.optimizer.param_groups[0]['lr']
+        log_msg = (
+            f"Epoch {epoch:4d} | "
+            f"Primary Loss: {avg_loss:.6f} | "
+            f"LR: {current_lr:.2e} | "
+            f"Postnet: {'ON' if self.model.enable_postnet else 'OFF'}"
+        )
+        self.log_file.write(log_msg + "\n")
+        self.log_file.flush()
         
         return avg_loss
     
@@ -208,7 +264,8 @@ class TimingTTSTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'train_losses': self.train_losses,
-            'best_loss': self.best_loss
+            'best_loss': self.best_loss,
+            'enable_postnet': self.model.enable_postnet
         }
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
@@ -221,7 +278,10 @@ class TimingTTSTrainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.train_losses = checkpoint.get('train_losses', [])
         self.best_loss = checkpoint.get('best_loss', float('inf'))
+        self.model.enable_postnet = checkpoint.get('enable_postnet', False)
         print(f"Checkpoint loaded from {path}")
+        if self.model.enable_postnet:
+            print(f"  Postnet: ENABLED")
         return checkpoint['epoch']
     
     def train(self, num_epochs: int, start_epoch: int = 1):
@@ -229,8 +289,21 @@ class TimingTTSTrainer:
         print(f"\nStarting training for {num_epochs} epochs...")
         print(f"Device: {self.device}")
         print(f"Training samples: {len(self.train_loader.dataset)}")
+        print(f"Postnet: Will activate when loss < 2.0")
         
         for epoch in range(start_epoch, start_epoch + num_epochs):
+            # Enable postnet when loss drops below 2.0
+            if self.best_loss < 2.0 and not self.model.enable_postnet:
+                print(f"\n🎯 Loss < 2.0 detected! Enabling Postnet for quality refinement...")
+                self.model.enable_postnet = True
+                print(f"   Postnet activated - training will now refine mel spectrograms\n")
+                
+                # Log postnet activation
+                self.log_file.write("\n" + "="*80 + "\n")
+                self.log_file.write(f"🎯 POSTNET ACTIVATED at epoch {epoch} (best_loss: {self.best_loss:.6f})\n")
+                self.log_file.write("="*80 + "\n")
+                self.log_file.flush()
+            
             # Train
             train_loss = self.train_epoch(epoch)
             print(f"Epoch {epoch}/{start_epoch + num_epochs - 1} - Train Loss: {train_loss:.4f}")
@@ -244,6 +317,10 @@ class TimingTTSTrainer:
                 checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_model_timing.pt")
                 self.save_checkpoint(epoch, checkpoint_path)
                 print(f"✓ New best model saved (loss: {train_loss:.4f})")
+                
+                # Log best model save
+                self.log_file.write(f"  → New best model saved (loss: {train_loss:.6f})\n")
+                self.log_file.flush()
             
             # Generate sample audio every 10 epochs
             if epoch % 10 == 0:
@@ -257,6 +334,16 @@ class TimingTTSTrainer:
         
         print("\nTraining completed!")
         print(f"Best training loss: {self.best_loss:.4f}")
+        
+        # Log training completion
+        self.log_file.write("\n" + "="*80 + "\n")
+        self.log_file.write(f"Training completed at {self._get_timestamp()}\n")
+        self.log_file.write(f"Best loss: {self.best_loss:.6f}\n")
+        self.log_file.write(f"Total epochs: {len(self.train_losses)}\n")
+        self.log_file.write(f"Final LR: {self.optimizer.param_groups[0]['lr']:.2e}\n")
+        self.log_file.write(f"Postnet enabled: {self.model.enable_postnet}\n")
+        self.log_file.write("="*80 + "\n")
+        self.log_file.close()
         
         # Save training history
         history = {
@@ -273,7 +360,14 @@ class TimingTTSTrainer:
         with torch.no_grad():
             text_tokens = text_tokens.unsqueeze(0).to(self.device)
             output = self.model(text_tokens, target_frames=target_frames)
-            mel_pred = output['mel_pred'].squeeze(0)
+            
+            # Use postnet output if available, otherwise use regular mel
+            mel_postnet = output.get('mel_postnet')
+            if mel_postnet is not None:
+                mel_pred = mel_postnet.squeeze(0)
+                print(f"  Using postnet output (high quality)")
+            else:
+                mel_pred = output['mel_pred'].squeeze(0)
         
         # Convert mel to audio using Griffin-Lim
         mel = torch.exp(mel_pred)
@@ -315,7 +409,7 @@ def main():
                        help=f"Learning rate (default: {LEARNING_RATE})")
     parser.add_argument("-e", "--epochs", type=int, default=NUM_EPOCHS,
                        help=f"Number of epochs (default: {NUM_EPOCHS})")
-    parser.add_argument("-c", "--continue-training", action="store_true",
+    parser.add_argument("-c", "--continue-training", action="store_true", default=False,
                        help="Continue training from best saved checkpoint")
     parser.add_argument("--device", type=str, default=DEVICE,
                        help=f"Device to use: cuda or cpu (default: {DEVICE})")

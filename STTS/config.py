@@ -18,13 +18,13 @@ F_MIN = 0
 F_MAX = 8000
 
 # Model Architecture
-HIDDEN_DIM = 256
-NUM_LAYERS = 4
+HIDDEN_DIM = 1024  # Double model size (256→512 for ~3M params)
+NUM_LAYERS = 2    # LSTM layers (increase to 6 for more capacity)
 NUM_HEADS = 4
 DROPOUT = 0.1
 
 # Training
-BATCH_SIZE = 4  # Reduced since we process full sentences now
+BATCH_SIZE = 130  # Reduced since we process full sentences now
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 10000
 GRADIENT_CLIP = 1.0

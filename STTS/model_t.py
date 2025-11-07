@@ -49,10 +49,10 @@ class TimingBasedTTS(nn.Module):
         self.mel_prenet = nn.Sequential(
             nn.Linear(n_mels, prenet_dim),
             nn.ReLU(),
-            nn.Dropout(0.5),  # High dropout like original StudentTTSModel
+            #nn.Dropout(0.5),  # High dropout like original StudentTTSModel
             nn.Linear(prenet_dim, prenet_dim),
             nn.ReLU(),
-            nn.Dropout(0.5)
+            #nn.Dropout(0.5)
         )
         
         # GO frame (learnable initial frame)
@@ -76,6 +76,36 @@ class TimingBasedTTS(nn.Module):
         # Stop token predictor
         self.stop_token = nn.Linear(hidden_dim, 1)
         
+        # Postnet (5-layer CNN for mel refinement, like Tacotron 2)
+        # This will only be used when enable_postnet=True (loss < 2)
+        self.postnet = nn.Sequential(
+            nn.Conv1d(n_mels, 512, kernel_size=5, padding=2),
+            nn.BatchNorm1d(512),
+            nn.Tanh(),
+            nn.Dropout(0.5),
+            
+            nn.Conv1d(512, 512, kernel_size=5, padding=2),
+            nn.BatchNorm1d(512),
+            nn.Tanh(),
+            nn.Dropout(0.5),
+            
+            nn.Conv1d(512, 512, kernel_size=5, padding=2),
+            nn.BatchNorm1d(512),
+            nn.Tanh(),
+            nn.Dropout(0.5),
+            
+            nn.Conv1d(512, 512, kernel_size=5, padding=2),
+            nn.BatchNorm1d(512),
+            nn.Tanh(),
+            nn.Dropout(0.5),
+            
+            nn.Conv1d(512, n_mels, kernel_size=5, padding=2),
+            nn.BatchNorm1d(n_mels)
+        )
+        
+        # Postnet control flag (will be set by trainer)
+        self.enable_postnet = False
+        
         print(f"\n{'='*60}")
         print(f"Timing-Based TTS Model (Simplified)")
         print(f"{'='*60}")
@@ -87,6 +117,7 @@ class TimingBasedTTS(nn.Module):
         print(f"LSTM layers: {lstm_layers}")
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Total parameters: {total_params:,}")
+        print(f"Postnet: Included (activates when loss < 2)")
         print(f"{'='*60}\n")
     
     def forward(
@@ -184,10 +215,18 @@ class TimingBasedTTS(nn.Module):
         
         # Transpose mel to [batch, n_mels, frames]
         mel_pred = mel_pred.transpose(1, 2)
+        
+        # Apply postnet if enabled (for quality refinement)
+        mel_postnet = None
+        if False and self.enable_postnet:
+            mel_residual = self.postnet(mel_pred)  # [batch, n_mels, frames]
+            mel_postnet = mel_pred + mel_residual  # Residual connection
+        
         stop_tokens = stop_pred.squeeze(-1)  # [batch, frames]
         
         return {
-            'mel_pred': mel_pred,
+            'mel_pred': mel_pred,  # Before postnet
+            'mel_postnet': mel_postnet,  # After postnet (or None if disabled)
             'stop_tokens': stop_tokens
         }
     
@@ -264,8 +303,15 @@ class TimingBasedTTS(nn.Module):
         mel_pred = torch.stack(mel_outputs, dim=2)  # [batch, n_mels, num_frames]
         stop_tokens = torch.stack(stop_outputs, dim=1).squeeze(-1)  # [batch, num_frames]
         
+        # Apply postnet if enabled
+        mel_postnet = None
+        if False and self.enable_postnet:
+            mel_residual = self.postnet(mel_pred)
+            mel_postnet = mel_pred + mel_residual
+        
         return {
             'mel_pred': mel_pred,
+            'mel_postnet': mel_postnet,
             'stop_tokens': stop_tokens
         }
 
