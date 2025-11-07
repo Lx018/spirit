@@ -58,18 +58,21 @@ class TimingBasedTTS(nn.Module):
         self.mel_prenet = nn.Sequential(
             nn.Linear(n_mels, prenet_dim),
             nn.ReLU(),
-            #nn.Dropout(0.5),  # High dropout like original StudentTTSModel
+            nn.Dropout(0.5),  # High dropout like original StudentTTSModel
             nn.Linear(prenet_dim, prenet_dim),
             nn.ReLU(),
-            #nn.Dropout(0.5)
+            nn.Dropout(0.5)
         )
         
         # GO frame (learnable initial frame)
         self.go_frame = nn.Parameter(torch.zeros(1, n_mels))
         
+        # Padding embedding for word boundaries (used for prev/next word at start/end)
+        self.padding_embedding = nn.Parameter(torch.zeros(1, embedding_dim))
+        
         # LSTM decoder
-        # Input: mel_prenet(prev_frame) + word_embedding(current_word) + sentence_embedding
-        lstm_input_dim = prenet_dim + embedding_dim + embedding_dim
+        # Input: mel_prenet(prev_frame) + prev_word + curr_word + next_word + sentence_embedding
+        lstm_input_dim = prenet_dim + embedding_dim * 4  # prenet + 3 words + sentence
         
         self.lstm = nn.LSTM(
             lstm_input_dim,
@@ -203,22 +206,53 @@ class TimingBasedTTS(nn.Module):
         prenet_out = self.mel_prenet(decoder_input_mels)  # [batch, frames, prenet_dim]
         
         # Get word embeddings for each frame based on word_indices
-        # word_indices[b, t] tells us which word (0 to seq_len-1) for frame t
+        # Include previous, current, and next word for richer context
         word_idx = word_indices.clamp(0, seq_len - 1)  # [batch, num_frames]
         batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(word_idx)
+        
+        # Current word embedding
         current_word_embeddings = word_embeddings[batch_indices, word_idx]  # [batch, frames, embedding_dim]
+        
+        # Previous word embedding
+        # For first word: use padding embedding instead of repeating
+        prev_word_embeddings = torch.zeros(batch_size, num_frames, self.embedding_dim, device=device)
+        # First frame (word start): use padding
+        prev_word_embeddings[:, 0] = self.padding_embedding.expand(batch_size, -1)
+        # Other frames: use actual previous word
+        for t in range(1, num_frames):
+            if word_idx[0, t] != word_idx[0, t-1]:  # Word boundary
+                # Use previous word embedding
+                prev_word_embeddings[:, t] = word_embeddings[batch_indices[:, t], word_idx[:, t-1]]
+            else:
+                # Same word, use same embedding as current
+                prev_word_embeddings[:, t] = current_word_embeddings[:, t]
+        
+        # Next word embedding
+        # For last word: use padding embedding instead of repeating
+        next_word_embeddings = torch.zeros(batch_size, num_frames, self.embedding_dim, device=device)
+        for t in range(num_frames - 1):
+            if word_idx[0, t] != word_idx[0, t+1]:  # Word boundary
+                # Use next word embedding
+                next_word_embeddings[:, t] = word_embeddings[batch_indices[:, t], word_idx[:, t+1]]
+            else:
+                # Same word, use same embedding as current
+                next_word_embeddings[:, t] = current_word_embeddings[:, t]
+        # Last frame: use padding
+        next_word_embeddings[:, -1] = self.padding_embedding.expand(batch_size, -1)
         
         # Expand sentence embedding
         sentence_embedding_expanded = sentence_embedding.unsqueeze(1).expand(
             batch_size, num_frames, self.embedding_dim
         )  # [batch, frames, embedding_dim]
         
-        # Concatenate all inputs: prenet + word_emb + sentence_emb
+        # Concatenate all inputs: prenet + prev_word + curr_word + next_word + sentence_emb
         lstm_input = torch.cat([
             prenet_out,
+            prev_word_embeddings,
             current_word_embeddings,
+            next_word_embeddings,
             sentence_embedding_expanded
-        ], dim=-1)  # [batch, frames, prenet_dim + embedding_dim + embedding_dim]
+        ], dim=-1)  # [batch, frames, prenet_dim + 3*embedding_dim + embedding_dim]
         
         # LSTM decoder
         lstm_out, _ = self.lstm(lstm_input)  # [batch, frames, hidden_dim]
@@ -279,18 +313,46 @@ class TimingBasedTTS(nn.Module):
         
         # Generate frame by frame (like StudentTTSModel)
         for t in range(max_frames):
-            # Get word embedding for current frame
+            # Get word embeddings for current frame (prev, curr, next)
             word_idx = word_indices[:, t].clamp(0, seq_len - 1)
             batch_indices = torch.arange(batch_size, device=device)
             current_word_embedding = word_embeddings[batch_indices, word_idx]  # [batch, embedding_dim]
             
+            # Previous word embedding
+            # Use padding for first word frames
+            if t > 0 and word_indices[0, t] != word_indices[0, t-1]:
+                # Word boundary - use previous word
+                prev_word_idx = word_indices[:, t-1].clamp(0, seq_len - 1)
+                prev_word_embedding = word_embeddings[batch_indices, prev_word_idx]
+            elif t == 0:
+                # First frame - use padding
+                prev_word_embedding = self.padding_embedding.expand(batch_size, -1)
+            else:
+                # Same word - use current
+                prev_word_embedding = current_word_embedding
+            
+            # Next word embedding
+            # Use padding for last word frames
+            if t < max_frames - 1 and word_indices[0, t] != word_indices[0, t+1]:
+                # Word boundary - use next word
+                next_word_idx = word_indices[:, t+1].clamp(0, seq_len - 1)
+                next_word_embedding = word_embeddings[batch_indices, next_word_idx]
+            elif t == max_frames - 1:
+                # Last frame - use padding
+                next_word_embedding = self.padding_embedding.expand(batch_size, -1)
+            else:
+                # Same word - use current
+                next_word_embedding = current_word_embedding
+            
             # Process previous mel through prenet
             prenet_out = self.mel_prenet(prev_mel)  # [batch, prenet_dim]
             
-            # Concatenate: prenet + word_emb + sentence_emb
+            # Concatenate: prenet + prev_word + curr_word + next_word + sentence_emb
             lstm_input = torch.cat([
                 prenet_out,
+                prev_word_embedding,
                 current_word_embedding,
+                next_word_embedding,
                 sentence_embedding
             ], dim=-1).unsqueeze(1)  # [batch, 1, lstm_input_dim]
             

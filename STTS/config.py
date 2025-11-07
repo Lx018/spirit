@@ -12,7 +12,7 @@ LOG_DIR = "./logs"
 # Audio Processing
 SAMPLE_RATE = 22050  # Standard TTS sample rate
 N_FFT = 1024
-HOP_LENGTH = 256
+HOP_LENGTH = 128  # Lower = higher framerate (128 = ~172 fps, 256 = ~86 fps, 512 = ~43 fps)
 N_MELS = 80
 F_MIN = 0
 F_MAX = 8000
@@ -24,7 +24,7 @@ NUM_HEADS = 4
 DROPOUT = 0.1
 
 # Training
-BATCH_SIZE = 130  # Reduced since we process full sentences now
+BATCH_SIZE = 130
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 10000
 GRADIENT_CLIP = 1.0

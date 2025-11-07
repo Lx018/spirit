@@ -61,11 +61,26 @@ def test_mel_reconstruction(input_wav: str, output_wav: str):
         n_stft=N_FFT // 2 + 1,
         n_mels=N_MELS,
         sample_rate=SAMPLE_RATE,
-        f_min=F_MIN,
-        f_max=F_MAX
-    )
+    ).T  # [n_mels, n_freqs]
     
-    spec = inverse_mel(mel_linear.squeeze(0))
+    # Use regularized least squares for numerical stability with high mel bins
+    # Solve: (M^T M + λI) x = M^T mel, where M is mel_basis
+    print(f"   Computing regularized pseudo-inverse...")
+    mel_basis_cpu = mel_basis
+    reg = 1e-6
+    # mel_basis is [n_mels, n_freqs], we want to solve for spec [n_freqs, time]
+    # M @ spec ≈ mel_linear, so spec = (M^T M + λI)^-1 M^T mel_linear
+    mel_basis_pinv = torch.linalg.solve(
+        mel_basis_cpu @ mel_basis_cpu.T + reg * torch.eye(mel_basis_cpu.shape[0]),
+        mel_basis_cpu
+    ).T  # [n_freqs, n_mels]
+    
+    # Convert mel back to linear spectrogram
+    spec = torch.mm(mel_basis_pinv, mel_linear.squeeze(0))  # [n_freqs, time]
+    
+    # Clamp to avoid extreme values
+    spec = torch.clamp(spec, min=0.0, max=100.0)
+    print(f"   Spec range after clamp: [{spec.min():.2f}, {spec.max():.2f}]")
     
     # Griffin-Lim vocoder
     vocoder = torchaudio.transforms.GriffinLim(

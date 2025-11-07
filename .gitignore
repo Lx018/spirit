@@ -22,3 +22,7 @@ STTS/data/*
 STTS/__pycache__/*
 index-tts
 STTS/logs/training_log_timing.txt
+STTS/datawav/*
+STTS/out/*
+GPT-SoVITS/output.wav
+STTS/logs/training_history_timing.json
