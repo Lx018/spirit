@@ -45,6 +45,15 @@ class TimingBasedTTS(nn.Module):
         # Simple word embedding (no transformer - keep it fast like original!)
         self.word_embedding = nn.Embedding(vocab_size, embedding_dim)
         
+        # Sentence encoder (separate BiLSTM to encode full sentence context)
+        self.sentence_encoder = nn.LSTM(
+            embedding_dim,
+            embedding_dim // 2,  # Bidirectional, so total output = embedding_dim
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        
         # Mel prenet (for previous frame) - high dropout like original
         self.mel_prenet = nn.Sequential(
             nn.Linear(n_mels, prenet_dim),
@@ -107,7 +116,7 @@ class TimingBasedTTS(nn.Module):
         self.enable_postnet = False
         
         print(f"\n{'='*60}")
-        print(f"Timing-Based TTS Model (Simplified)")
+        print(f"Timing-Based TTS Model with Sentence Encoder")
         print(f"{'='*60}")
         print(f"Vocab size: {vocab_size}")
         print(f"Mel bins: {n_mels}")
@@ -115,6 +124,7 @@ class TimingBasedTTS(nn.Module):
         print(f"Embedding dim: {embedding_dim}")
         print(f"Prenet dim: {prenet_dim}")
         print(f"LSTM layers: {lstm_layers}")
+        print(f"Sentence encoder: BiLSTM (context-aware)")
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Total parameters: {total_params:,}")
         print(f"Postnet: Included (activates when loss < 2)")
@@ -141,11 +151,15 @@ class TimingBasedTTS(nn.Module):
         """
         batch_size = text_tokens.size(0)
         
-        # Simple word embeddings (no transformer - keep it fast!)
+        # Get word embeddings (one per word in sentence)
         word_embeddings = self.word_embedding(text_tokens)  # [batch, seq_len, embedding_dim]
         
-        # Get sentence-level embedding (mean pooling - this works great!)
-        sentence_embedding = word_embeddings.mean(dim=1)  # [batch, embedding_dim]
+        # Encode sentence with bidirectional LSTM
+        # This captures context from both directions (past and future words)
+        sentence_encoded, _ = self.sentence_encoder(word_embeddings)  # [batch, seq_len, embedding_dim]
+        
+        # Get global sentence embedding (mean pooling over encoded sequence)
+        sentence_embedding = sentence_encoded.mean(dim=1)  # [batch, embedding_dim]
         
         # Training mode: use word_indices and teacher forcing
         if word_indices is not None and mel_targets is not None:
