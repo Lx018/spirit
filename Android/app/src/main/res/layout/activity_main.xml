@@ -67,6 +67,35 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:text="Wake Word:"
+                android:textSize="14sp"
+                android:paddingEnd="8dp" />
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/wakeWordInput"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="spirit,精灵,hey spirit"
+                android:text="spirit"
+                android:textSize="16sp"
+                android:singleLine="true"
+                android:imeOptions="actionDone"
+                android:inputType="text" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/sensitivityLayout"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:padding="8dp"
+            android:gravity="center_vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
                 android:text="Sensitivity:"
                 android:textSize="14sp"
                 android:paddingEnd="8dp" />

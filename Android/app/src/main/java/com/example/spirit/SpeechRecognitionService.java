@@ -5,7 +5,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
@@ -26,8 +30,24 @@ public class SpeechRecognitionService extends Service {
     private Intent recognizerIntent;
     private boolean isListening = false;
     private boolean shouldRestart = true;
+    private String wakeWord = "spirit";
+    private SharedPreferences prefs;
     
     private final IBinder binder = new LocalBinder();
+    
+    // Broadcast receiver for wake word updates
+    private BroadcastReceiver wakeWordReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if ("com.example.spirit.UPDATE_WAKE_WORD".equals(intent.getAction())) {
+                String newWakeWord = intent.getStringExtra("wake_word");
+                if (newWakeWord != null && !newWakeWord.isEmpty()) {
+                    wakeWord = newWakeWord;
+                    Log.d(TAG, "Wake words updated to: " + wakeWord);
+                }
+            }
+        }
+    };
     
     public class LocalBinder extends Binder {
         SpeechRecognitionService getService() {
@@ -44,6 +64,18 @@ public class SpeechRecognitionService extends Service {
     public void onCreate() {
         super.onCreate();
         Log.d(TAG, "Service created");
+        
+        // Load wake word from preferences
+        prefs = getSharedPreferences("spirit_prefs", MODE_PRIVATE);
+        wakeWord = prefs.getString("wake_word", "spirit");
+        
+        // Register broadcast receiver for wake word updates
+        IntentFilter filter = new IntentFilter("com.example.spirit.UPDATE_WAKE_WORD");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(wakeWordReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(wakeWordReceiver, filter);
+        }
         
         createNotificationChannel();
         setupSpeechRecognizer();
@@ -139,8 +171,8 @@ public class SpeechRecognitionService extends Service {
                     intent.putExtra("is_final", true);
                     sendBroadcast(intent);
                     
-                    // Check for wake word
-                    if (recognizedText.toLowerCase().contains("spirit")) {
+                    // Check for wake words (supports multiple words separated by comma)
+                    if (containsAnyWakeWord(recognizedText)) {
                         onWakeWordDetected(recognizedText);
                     }
                 }
@@ -200,8 +232,22 @@ public class SpeechRecognitionService extends Service {
         }
     }
     
+    private boolean containsAnyWakeWord(String text) {
+        String lowerText = text.toLowerCase();
+        String[] wakeWords = wakeWord.split(",");
+        
+        for (String word : wakeWords) {
+            String trimmedWord = word.trim().toLowerCase();
+            if (!trimmedWord.isEmpty() && lowerText.contains(trimmedWord)) {
+                Log.d(TAG, "Matched wake word: " + trimmedWord);
+                return true;
+            }
+        }
+        return false;
+    }
+    
     private void onWakeWordDetected(String fullText) {
-        Log.d(TAG, "Wake word 'Spirit' detected in: " + fullText);
+        Log.d(TAG, "Wake word detected in: " + fullText);
         
         // Use WakeWordActivity to popup
         Intent intent = new Intent(this, WakeWordActivity.class);
@@ -261,6 +307,7 @@ public class SpeechRecognitionService extends Service {
     public void onDestroy() {
         super.onDestroy();
         shouldRestart = false;
+        unregisterReceiver(wakeWordReceiver);
         if (speechRecognizer != null) {
             speechRecognizer.destroy();
         }

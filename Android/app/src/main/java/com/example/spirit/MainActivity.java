@@ -7,12 +7,15 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.provider.Settings;
+import android.text.Editable;
+import android.text.TextWatcher;
 
 import com.google.android.material.slider.Slider;
 import com.google.android.material.snackbar.Snackbar;
@@ -41,6 +44,9 @@ public class MainActivity extends AppCompatActivity {
     private StringBuilder recognizedText = new StringBuilder();
     private String currentPartialText = "";
     private boolean serviceBound = false;
+    private SharedPreferences prefs;
+    private static final String PREF_WAKE_WORD = "wake_word";
+    private String currentWakeWord = "spirit";
     
     // Broadcast receiver for speech recognition results
     private BroadcastReceiver speechReceiver = new BroadcastReceiver() {
@@ -130,6 +136,46 @@ public class MainActivity extends AppCompatActivity {
 
         setSupportActionBar(binding.toolbar);
 
+        // Initialize SharedPreferences
+        prefs = getSharedPreferences("spirit_prefs", MODE_PRIVATE);
+        currentWakeWord = prefs.getString(PREF_WAKE_WORD, "spirit");
+        
+        // Setup wake word input field
+        binding.wakeWordInput.setText(currentWakeWord);
+        binding.wakeWordInput.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                String newWakeWord = s.toString().trim();
+                if (!newWakeWord.isEmpty() && !newWakeWord.equals(currentWakeWord)) {
+                    currentWakeWord = newWakeWord;
+                    // Save to preferences
+                    prefs.edit().putString(PREF_WAKE_WORD, currentWakeWord).apply();
+                    // Update service
+                    updateWakeWordInService(currentWakeWord);
+                    // Update instructions text
+                    String[] words = currentWakeWord.split(",");
+                    String displayText = words.length > 1 
+                        ? "Listening for: " + currentWakeWord + " - Recognized words below:" 
+                        : "Listening for '" + currentWakeWord + "' - Recognized words below:";
+                    binding.instructionsText.setText(displayText);
+                    Toast.makeText(MainActivity.this, "Wake words updated", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+        
+        // Update instructions text with current wake word
+        String[] words = currentWakeWord.split(",");
+        String displayText = words.length > 1 
+            ? "Listening for: " + currentWakeWord + " - Recognized words below:" 
+            : "Listening for '" + currentWakeWord + "' - Recognized words below:";
+        binding.instructionsText.setText(displayText);
+
         // Register broadcast receivers for speech recognition
         IntentFilter filter = new IntentFilter();
         filter.addAction("com.example.spirit.SPEECH_RESULT");
@@ -167,12 +213,18 @@ public class MainActivity extends AppCompatActivity {
         }
         
         // Hide slider section (no longer needed with speech recognition)
-        binding.energyThresholdSlider.setEnabled(false);
-        binding.energyThresholdSlider.setVisibility(View.GONE);
-        binding.thresholdValue.setVisibility(View.GONE);
+        binding.sensitivityLayout.setVisibility(View.GONE);
         
         // Start listening automatically
         requestPermissionsAndStart();
+    }
+    
+    private void updateWakeWordInService(String wakeWord) {
+        // Send broadcast to update wake word in service
+        Intent intent = new Intent("com.example.spirit.UPDATE_WAKE_WORD");
+        intent.setPackage(getPackageName());
+        intent.putExtra("wake_word", wakeWord);
+        sendBroadcast(intent);
     }
     
     @Override
