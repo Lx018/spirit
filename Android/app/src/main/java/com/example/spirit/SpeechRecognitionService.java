@@ -114,6 +114,7 @@ public class SpeechRecognitionService extends Service {
         recognizerIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         recognizerIntent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
         recognizerIntent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000);
+        recognizerIntent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);  // Use offline mode by default
         
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
             @Override
@@ -249,9 +250,11 @@ public class SpeechRecognitionService extends Service {
     private void onWakeWordDetected(String fullText) {
         Log.d(TAG, "Wake word detected in: " + fullText);
         
-        // Use WakeWordActivity to popup
+        // Method 1: Try to launch activity directly
         Intent intent = new Intent(this, WakeWordActivity.class);
-        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | 
+                       Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                       Intent.FLAG_ACTIVITY_SINGLE_TOP);
         
         try {
             startActivity(intent);
@@ -259,11 +262,18 @@ public class SpeechRecognitionService extends Service {
             Log.e(TAG, "Failed to start WakeWordActivity: " + e.getMessage());
         }
         
-        // Send notification
+        // Method 2: Send high-priority full-screen notification as backup
         Intent mainIntent = new Intent(this, MainActivity.class);
+        mainIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | 
+                           Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                           Intent.FLAG_ACTIVITY_SINGLE_TOP);
         mainIntent.putExtra("wake_word_detected", true);
         
         PendingIntent pendingIntent = PendingIntent.getActivity(this, 0,
+                mainIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        
+        // Create full-screen intent for Android 10+ to bypass restrictions
+        PendingIntent fullScreenIntent = PendingIntent.getActivity(this, 1,
                 mainIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         
         NotificationManager notificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
@@ -272,8 +282,12 @@ public class SpeechRecognitionService extends Service {
                 .setContentText(fullText)
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setContentIntent(pendingIntent)
+                .setFullScreenIntent(fullScreenIntent, true)  // Force full-screen
                 .setAutoCancel(true)
                 .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_CALL)  // Treat as call for higher priority
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOngoing(false)
                 .build();
         
         if (notificationManager != null) {
@@ -316,6 +330,7 @@ public class SpeechRecognitionService extends Service {
     
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Main service channel (low priority)
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID,
                     "Speech Recognition Service",

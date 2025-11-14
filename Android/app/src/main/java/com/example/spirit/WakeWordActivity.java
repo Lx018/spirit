@@ -18,6 +18,11 @@ public class WakeWordActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         
+        // Make window appear on top of everything
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getWindow().setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+        }
+        
         // Show over lockscreen
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true);
@@ -29,6 +34,12 @@ public class WakeWordActivity extends AppCompatActivity {
             );
         }
         
+        // Additional flags to ensure we show on top
+        getWindow().addFlags(
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        );
+        
         // Dismiss keyguard if possible
         KeyguardManager keyguardManager = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -37,7 +48,10 @@ public class WakeWordActivity extends AppCompatActivity {
         
         // Immediately redirect to MainActivity
         Intent intent = new Intent(this, MainActivity.class);
-        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | 
+                       Intent.FLAG_ACTIVITY_CLEAR_TOP | 
+                       Intent.FLAG_ACTIVITY_SINGLE_TOP |
+                       Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
         intent.putExtra("wake_word_detected", true);
         startActivity(intent);
         
