@@ -19,7 +19,95 @@
 
     </com.google.android.material.appbar.AppBarLayout>
 
-    <include layout="@layout/content_main" />
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="16dp"
+        app:layout_behavior="@string/appbar_scrolling_view_behavior">
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Listening for 'Spirit'..."
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:padding="16dp" />
+
+        <TextView
+            android:id="@+id/instructionsText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Recognized words will appear below:"
+            android:textSize="14sp"
+            android:gravity="center"
+            android:paddingBottom="8dp" />
+
+        <TextView
+            android:id="@+id/energyLevel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Energy: 0"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#FF6200EE"
+            android:gravity="center"
+            android:padding="8dp"
+            android:background="#F0F0F0" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:padding="8dp"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Sensitivity:"
+                android:textSize="14sp"
+                android:paddingEnd="8dp" />
+
+            <com.google.android.material.slider.Slider
+                android:id="@+id/energyThresholdSlider"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:valueFrom="50"
+                android:valueTo="2000"
+                android:value="300"
+                android:stepSize="50" />
+
+            <TextView
+                android:id="@+id/thresholdValue"
+                android:layout_width="60dp"
+                android:layout_height="wrap_content"
+                android:text="300"
+                android:textSize="14sp"
+                android:gravity="end"
+                android:paddingStart="8dp" />
+        </LinearLayout>
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:background="@android:color/white"
+            android:padding="8dp">
+
+            <TextView
+                android:id="@+id/recognizedWords"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="16sp"
+                android:textColor="@android:color/black"
+                android:padding="8dp"
+                android:text="Waiting for speech..." />
+        </ScrollView>
+    </LinearLayout>
 
     <com.google.android.material.floatingactionbutton.FloatingActionButton
         android:id="@+id/fab"
@@ -28,6 +116,6 @@
         android:layout_gravity="bottom|end"
         android:layout_marginEnd="@dimen/fab_margin"
         android:layout_marginBottom="16dp"
-        app:srcCompat="@android:drawable/ic_dialog_email" />
+        app:srcCompat="@android:drawable/ic_btn_speak_now" />
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>
