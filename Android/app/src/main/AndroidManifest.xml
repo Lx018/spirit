@@ -49,6 +49,13 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+            
+        <!-- Speech Recognition Service -->
+        <service
+            android:name=".SpeechRecognitionService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 
 </manifest>
