@@ -10,10 +10,12 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.media.AudioManager;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
@@ -28,6 +30,8 @@ public class SpeechRecognitionService extends Service {
     
     private SpeechRecognizer speechRecognizer;
     private Intent recognizerIntent;
+    private PowerManager.WakeLock wakeLock;
+    private AudioManager audioManager;
     private boolean isListening = false;
     private boolean shouldRestart = true;
     private String wakeWord = "spirit";
@@ -65,6 +69,14 @@ public class SpeechRecognitionService extends Service {
         super.onCreate();
         Log.d(TAG, "Service created");
         
+        // Acquire wake lock to keep service running
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Spirit::VoiceRecognitionLock");
+        wakeLock.acquire();
+        
+        // Get audio manager to maintain audio focus
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        
         // Load wake word from preferences
         prefs = getSharedPreferences("spirit_prefs", MODE_PRIVATE);
         wakeWord = prefs.getString("wake_word", "spirit");
@@ -96,6 +108,9 @@ public class SpeechRecognitionService extends Service {
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setContentIntent(pendingIntent)
                 .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
                 .build();
 
         startForeground(NOTIFICATION_ID, notification);
@@ -325,18 +340,26 @@ public class SpeechRecognitionService extends Service {
         if (speechRecognizer != null) {
             speechRecognizer.destroy();
         }
+        // Release wake lock
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+        }
         Log.d(TAG, "Service destroyed");
     }
     
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // Main service channel (low priority)
+            // Main service channel (high importance to prevent killing)
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID,
-                    "Speech Recognition Service",
-                    NotificationManager.IMPORTANCE_LOW
+                    "Spirit Voice Recognition",
+                    NotificationManager.IMPORTANCE_HIGH  // High importance like calls
             );
-            channel.setDescription("Listens for speech and wake word");
+            channel.setDescription("Continuous voice recognition service");
+            channel.setSound(null, null);  // No sound for ongoing notification
+            channel.enableVibration(false);
+            channel.setShowBadge(false);
+            channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
             
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) {
